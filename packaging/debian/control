@@ -1,0 +1,18 @@
+Package: h3-rs
+Version: @VERSION@
+Section: video
+Priority: optional
+Architecture: @ARCH@
+Depends: libcuda1, ffmpeg
+Maintainer: apiplant <releases@apiplant.com>
+Installed-Size: @INSTALLED_SIZE@
+Homepage: https://github.com/apiplant/h3-rs
+Description: MiniMax H3 video with stereo audio on NVIDIA GPUs (Rust, CUDA)
+ h3 renders text, keyframes or reference pictures, videos and voices to
+ an MP4 with a stereo soundtrack, loading the ComfyUI MiniMax H3
+ checkpoints as they are. `h3 serve` adds an HTTP API and a built-in
+ web UI. Needs an NVIDIA GPU (Ampere or newer) and the ComfyUI model
+ files. It links the CUDA 13 runtime (libcudart, libcublas, libnvrtc,
+ libcurand), which is not packaged by Debian or Ubuntu: install it from
+ NVIDIA's CUDA repository. libcuda1 (installed by the NVIDIA driver
+ package) satisfies the driver link only.

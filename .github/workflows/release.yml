@@ -1,0 +1,683 @@
+name: release
+
+# Tag a version to cut a release:
+#
+#   git tag v0.x.0 && git push origin v0.x.0
+#
+# h3 is CUDA-only, so there is one platform: Linux x86_64. That builds the
+# `h3` binary (in a CUDA 13 container, and again inside Arch against Arch's
+# own CUDA), attaches the archives, checksums and distro packages to the GitHub
+# release, and publishes the Homebrew formula, the apt and pacman repos and the
+# crate.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (dry run: no release is published)"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # workflow_dispatch has no tag ref: fall back to the tag input, or v0.0.0.
+  TAG: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag || 'v0.0.0' }}
+  # The runners have no GPU, so nvidia-smi cannot say which architecture to
+  # target. candle compiles its kernels for one compute capability: sm_80 PTX,
+  # which the driver JIT-compiles on newer GPUs (the int8 GEMM and attention
+  # kernels are built with NVRTC at run time for whatever GPU is present).
+  CUDA_COMPUTE_CAP: "80"
+  # no flash-attn: the engine has its own int8 attention, and flash-attn adds ~15 minutes
+  CARGO_FEATURES: "--no-default-features --features serve"
+  # build.rs embeds ui/dist in the binary; fail rather than ship one without the web UI.
+  H3_REQUIRE_UI: "1"
+
+jobs:
+  # The web UI `h3 serve` embeds at /. Built once; every cargo build below
+  # downloads it into ui/dist first.
+  ui:
+    name: web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Build
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  # nvcc and the CUDA headers/libraries are needed at build time, not a GPU;
+  # the devel image provides them. 12.8 is the first toolkit with sm_120.
+  binary:
+    name: x86_64-unknown-linux-gnu (cuda)
+    needs: ui
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:13.0.2-devel-ubuntu22.04
+    env:
+      CUDA_PATH: /usr/local/cuda
+      # .cargo/config.toml pins 13.4 for the author's machine; this image is 13.0
+      CUDARC_CUDA_VERSION: "13000"
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-unknown-linux-gnu-cuda
+
+      - name: Build
+        run: cargo build --profile dist --locked --bins $CARGO_FEATURES
+
+      # The binary links libcuda, which only exists where a driver is installed,
+      # so it cannot run here: check that the CUDA 13 libraries are what it wants.
+      - name: Check the link
+        run: readelf -d target/dist/h3 | grep -E 'NEEDED.*(cudart|cublas|nvrtc)'
+
+      - name: Package
+        shell: bash
+        run: |
+          name="h3-rs-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp target/dist/h3 README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-gnu
+          path: |
+            h3-rs-*.tar.gz
+            h3-rs-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # The Arch package is built inside Arch against Arch's own `cuda` package.
+  # The build above links the CUDA 13 runtime (libcudart.so.13,
+  # libcublas.so.13); Arch ships a newer CUDA with a different soname, so that
+  # binary fails to start there. Building where the package will be installed
+  # keeps the link and the `cuda` dependency in step.
+  binary-arch:
+    name: x86_64-unknown-linux-gnu (cuda, arch)
+    needs: ui
+    runs-on: ubuntu-latest
+    # Rolling Arch can break a CUDA build before anything in this repository
+    # changes; the Arch package then falls back to the generic archive instead
+    # of blocking the release.
+    continue-on-error: true
+    container: archlinux:base-devel
+    steps:
+      - name: Install build tools
+        run: pacman -Sy --noconfirm --needed rust cuda git ffmpeg
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH=/opt/cuda/bin:$PATH CUDA_PATH=/opt/cuda CUDA_HOME=/opt/cuda
+          # cudarc wants the toolkit version as major*1000+minor*10 (13.4 -> 13040)
+          read -r maj min < <(nvcc --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p')
+          export CUDARC_CUDA_VERSION=$((maj*1000+min*10))
+          cargo build --profile dist --locked --bins $CARGO_FEATURES
+
+      - name: Package
+        shell: bash
+        run: |
+          name="h3-rs-arch-${TAG}-x86_64-unknown-linux-gnu"
+          mkdir "$name"
+          cp target/dist/h3 README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-x86_64-unknown-linux-gnu-arch
+          path: |
+            h3-rs-arch-*.tar.gz
+            h3-rs-arch-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Repackaging, not building: the .deb and the pacman package are assembled
+  # from the archives the build jobs produced.
+  packages:
+    name: distro packages
+    needs: [binary, binary-arch]
+    if: ${{ !cancelled() && needs.binary.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Build the Debian package
+        run: |
+          version="${TAG#v}"
+          mkdir -p debs
+          tar xzf "dist/h3-rs-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          src="h3-rs-${TAG}-x86_64-unknown-linux-gnu"
+          root="stage/h3-rs-amd64"
+          install -Dm755 "$src/h3" "$root/usr/bin/h3"
+          install -Dm644 "$src/README.md" "$root/usr/share/doc/h3-rs/README.md"
+          # dpkg reports installed size in KiB, and dpkg-deb does not work it
+          # out on its own.
+          size=$(du -ks "$root/usr" | cut -f1)
+          install -d "$root/DEBIAN"
+          sed -e "s/@VERSION@/$version/" -e "s/@ARCH@/amd64/" -e "s/@INSTALLED_SIZE@/$size/" \
+            packaging/debian/control > "$root/DEBIAN/control"
+          if grep -qE '@[A-Z_]+@' "$root/DEBIAN/control"; then
+            echo "::error::unsubstituted placeholder in packaging/debian/control" >&2
+            exit 1
+          fi
+          dpkg-deb --root-owner-group --build "$root" "debs/h3-rs_${version}-1_amd64.deb"
+          cd debs && for deb in *.deb; do shasum -a 256 "$deb" > "$deb.sha256"; done
+
+      - name: Build the pacman package
+        run: |
+          version="${TAG#v}"
+          mkdir -p pkg
+          # Built against Arch's own CUDA when that job succeeded; otherwise the
+          # generic archive (which needs the CUDA 13 runtime).
+          prefix=h3-rs-arch
+          if [ ! -f "dist/$prefix-${TAG}-x86_64-unknown-linux-gnu.tar.gz" ]; then
+            echo "::warning::no Arch-built archive; the Arch package falls back to the CUDA 13 build"
+            prefix=h3-rs
+          fi
+          archive="dist/$prefix-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          dir=build-h3-rs
+          mkdir -p "$dir"
+          sed -e "s/@VERSION@/$version/g" -e "s/@ARCHIVE_PREFIX@/$prefix/g" \
+            -e "s/@SHA_LINUX_X86_64@/$(sha256sum "$archive" | cut -d' ' -f1)/" \
+            packaging/pacman/PKGBUILD > "$dir/PKGBUILD"
+          if grep -qE '@[A-Z_]+@' "$dir/PKGBUILD"; then
+            echo "::error::unsubstituted placeholder in PKGBUILD" >&2
+            exit 1
+          fi
+          # The release does not exist yet, so the archive is placed under the
+          # name the source line gives it: makepkg checksums it instead of
+          # fetching the URL.
+          cp "$archive" "$dir/h3-rs-$version-x86_64.tar.gz"
+          # makepkg refuses to run as root; the tree is handed back to the
+          # runner's uid afterwards.
+          docker run --rm -v "$PWD/$dir:/pkg" -e "OWNER=$(id -u):$(id -g)" \
+            archlinux:base-devel bash -c '
+              set -eu
+              useradd -m builder
+              chown -R builder /pkg
+              su builder -c "cd /pkg && makepkg --cleanbuild --force --nodeps -p PKGBUILD"
+              chown -R "$OWNER" /pkg
+            '
+          cp "$dir/h3-rs-$version-1-x86_64.pkg.tar.zst" pkg/
+          (cd pkg && shasum -a 256 "h3-rs-$version-1-x86_64.pkg.tar.zst" \
+            > "h3-rs-$version-1-x86_64.pkg.tar.zst.sha256")
+
+      # The .deb depends on libcuda1, which the runner should not be made to
+      # install (that pulls in a driver); check metadata and contents instead.
+      - name: Check
+        run: |
+          version="${TAG#v}"
+          crate_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$version" != "$crate_version" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $crate_version" >&2
+            exit 1
+          fi
+          deb="debs/h3-rs_${version}-1_amd64.deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb" | grep -q "./usr/bin/h3"
+          dpkg-deb --field "$deb" Depends | grep -q libcuda1
+          docker run --rm -v "$PWD/pkg:/pkg" archlinux:base-devel bash -c "
+            set -eu
+            pkg=/pkg/h3-rs-$version-1-x86_64.pkg.tar.zst
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgname = h3-rs'
+            bsdtar -xOf \"\$pkg\" .PKGINFO | grep -qx 'pkgver = $version-1'
+            bsdtar -tf \"\$pkg\" | grep -qx usr/bin/h3
+          "
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            debs/*.deb
+            debs/*.deb.sha256
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pacman-package
+          path: |
+            pkg/*.pkg.tar.zst
+            pkg/*.pkg.tar.zst.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [binary, binary-arch, packages]
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.packages.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: binary-*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: debian-packages
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: pacman-package
+
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            `h3` needs an NVIDIA GPU (Ampere or newer), a driver and the CUDA 13 runtime
+            (libcudart, libcublas, libnvrtc, libcurand), `ffmpeg`, and the ComfyUI
+            MiniMax H3 model files in a `models/` folder:
+
+            ```
+            H3_MODELS_DIR=~/ComfyUI/models h3 generate -p "A red fox trots through snow." -o fox.mp4
+            H3_MODELS_DIR=~/ComfyUI/models h3 serve        # web UI at http://127.0.0.1:8188
+            ```
+
+            ## Archive
+
+            `h3-rs-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz`: Linux x86_64, linked
+            against the CUDA 13 runtime (libcudart.so.13, libcublas.so.13).
+
+            ## Debian package
+
+            ```
+            sudo dpkg -i h3-rs_${{ steps.version.outputs.version }}-1_amd64.deb
+            ```
+
+            Also in the signed apt repository at `apt.apiplant.com`:
+
+            ```
+            curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
+            echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
+            sudo apt update && sudo apt install h3-rs
+            ```
+
+            ## Arch package
+
+            ```
+            sudo pacman -U h3-rs-${{ steps.version.outputs.version }}-1-x86_64.pkg.tar.zst
+            ```
+
+            Built against Arch's `cuda`. Also in the signed pacman repository at
+            `apiplant.github.io/pacman` (one-time setup):
+
+            ```
+            curl -sSfL https://apiplant.github.io/pacman/apiplant.gpg -o /tmp/apiplant.gpg
+            keyid=$(gpg --show-keys --with-colons /tmp/apiplant.gpg | awk -F: '/^pub:/ { print $5; exit }') && sudo pacman-key --add /tmp/apiplant.gpg && sudo pacman-key --finger "$keyid" && sudo pacman-key --lsign-key "$keyid"
+            printf '\n[apiplant]\nSigLevel = Required DatabaseOptional\nServer = https://apiplant.github.io/pacman/$arch\n' | sudo tee -a /etc/pacman.conf > /dev/null
+            sudo pacman -Sy h3-rs
+            ```
+
+            ## Homebrew (Linux x86_64)
+
+            ```
+            brew install apiplant/tap/h3-rs
+            ```
+
+            ## crates.io
+
+            ```
+            cargo install h3-rs                      # binary (needs the CUDA 13 toolkit)
+            cargo add h3-rs --no-default-features    # library
+            ```
+
+            Each archive and package has a matching `.sha256` file.
+
+  # Publishing the library: `cargo publish` verifies the package by building
+  # it, and the build script runs nvcc, so this runs in the CUDA container too.
+  crates-io:
+    name: crates.io
+    needs: [ui, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:13.0.2-devel-ubuntu22.04
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      CUDA_PATH: /usr/local/cuda
+      CARGO_FEATURES: "--no-default-features --features serve"
+      CUDA_COMPUTE_CAP: "80"
+      CUDARC_CUDA_VERSION: "13000"
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Publish
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        # ui/dist is built above and gitignored, but Cargo.toml `include`s it, so cargo sees it as uncommitted
+        run: cargo publish --locked --allow-dirty $CARGO_FEATURES
+
+  # The formula points at the release archive by URL, so it publishes after
+  # the release exists. Guarded on its credential: a fork, or this repository
+  # before the secret is set, skips it instead of failing the run.
+  homebrew:
+    name: homebrew tap
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    env:
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: binary-x86_64-unknown-linux-gnu
+
+      - name: Render the formula
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sha=$(shasum -a 256 "dist/h3-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$version/g" -e "s/@SHA_LINUX_X86_64@/$sha/" \
+            packaging/homebrew/h3-rs.rb > /tmp/h3-rs.rb
+          if grep -qE '@[A-Z_]+@' /tmp/h3-rs.rb; then
+            echo "::error::unsubstituted placeholder in the formula" >&2
+            exit 1
+          fi
+
+      - name: Push to apiplant/homebrew-tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/apiplant/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp /tmp/h3-rs.rb tap/Formula/h3-rs.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/h3-rs.rb
+          git diff --cached --quiet && exit 0
+          git commit -m "h3-rs $version"
+          git push
+
+  # The apt repository is cumulative: the new .debs are copied into the pool
+  # alongside the packages from other apiplant releases, and the indices are
+  # regenerated over the whole pool.
+  apt:
+    name: apt repository
+    needs: [packages, release]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # dpkg-scanpackages and apt-ftparchive are Debian's own tools; the runner
+    # has apt but not dpkg-dev, and a container is cheaper than installing it.
+    container: debian:bookworm
+    env:
+      APT_REPO_TOKEN: ${{ secrets.APT_REPO_TOKEN }}
+    steps:
+      - name: Install the archive tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends dpkg-dev apt-utils gnupg git ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          path: source
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: debs
+          name: debian-packages
+
+      - name: Import the signing key
+        if: env.APT_REPO_TOKEN != ''
+        env:
+          GPG_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_KEY" ]; then
+            echo "::error::APT_REPO_TOKEN is set but APT_GPG_PRIVATE_KEY is not" >&2
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          # The key id is needed explicitly: a CI keyring with one secret key
+          # still has no default, and an unsigned Release is one apt refuses.
+          gpg --list-secret-keys --with-colons \
+            | awk -F: '/^sec:/ { print $5; exit }' > /tmp/keyid
+          test -s /tmp/keyid
+
+      - name: Add the packages to the pool
+        if: env.APT_REPO_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${APT_REPO_TOKEN}@github.com/apiplant/apt.git" repo
+
+          # `pool/main/h/h3-rs/` is the layout apt expects: component,
+          # then the first letter of the source package, then the package.
+          mkdir -p repo/pool/main/h/h3-rs
+          cp debs/*.deb repo/pool/main/h/h3-rs/
+
+          size=$(du -sm repo/pool | cut -f1)
+          if [ "$size" -gt 700 ]; then
+            echo "::warning::the apt pool is ${size}MB; GitHub Pages stops at 1GB." \
+                 "Prune old versions from apiplant/apt or move the pool elsewhere."
+          fi
+
+      - name: Generate the indices
+        if: env.APT_REPO_TOKEN != ''
+        working-directory: repo
+        run: |
+          for arch in amd64 arm64; do
+            dir="dists/stable/main/binary-$arch"
+            mkdir -p "$dir"
+            # /dev/null as the override file: there is no Debian override
+            # database here, and dpkg-scanpackages insists on the argument.
+            dpkg-scanpackages --arch "$arch" pool /dev/null > "$dir/Packages"
+            gzip -9kf "$dir/Packages"
+            test -s "$dir/Packages"
+          done
+
+          # Written outside the tree and moved in: apt-ftparchive checksums
+          # every file under dists/stable, and a Release file it is midway
+          # through writing is one of them.
+          apt-ftparchive -c ../source/packaging/apt/apt-ftparchive.conf \
+            release dists/stable > /tmp/Release
+          mv /tmp/Release dists/stable/Release
+
+      - name: Sign and publish
+        if: env.APT_REPO_TOKEN != ''
+        working-directory: repo
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          keyid=$(cat /tmp/keyid)
+
+          # A passphrase-less key needs no --passphrase, and passing an empty
+          # one to gpg is an error rather than a no-op. Held in the positional
+          # parameters rather than an array: this job runs in a container, where
+          # the step shell is plain sh and `pass=()` is a syntax error.
+          set --
+          if [ -n "$GPG_PASSPHRASE" ]; then
+            set -- --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE"
+          fi
+
+          # Both signatures: InRelease is what apt fetches, Release.gpg is what
+          # older clients and mirroring tools still look for.
+          gpg --batch --yes "$@" --local-user "$keyid" \
+            --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes "$@" --local-user "$keyid" \
+            --detach-sign --armor -o dists/stable/Release.gpg dists/stable/Release
+
+          # The keyring users install, dearmored so it can be dropped into
+          # /usr/share/keyrings and named by `signed-by` as-is.
+          rm -f apiplant.gpg
+          gpg --export "$keyid" > apiplant.gpg
+
+          # GitHub Pages runs Jekyll otherwise, which would rewrite parts of a
+          # tree that has to be served byte-for-byte.
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "h3-rs $version"
+          git push
+
+  # The pacman repository is cumulative: the new package files are copied into
+  # the architecture directory, signed, and added to the repository database
+  # alongside the packages from other apiplant releases. x86_64 only, matching
+  # what the `packages` job builds.
+  pacman:
+    name: pacman repository
+    needs: [release, packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    env:
+      PACMAN_REPO_TOKEN: ${{ secrets.PACMAN_REPO_TOKEN }}
+    steps:
+      - name: Install the archive tools
+        run: pacman -Sy --noconfirm --needed git gnupg ca-certificates
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          name: pacman-package
+
+      - name: Import the signing key
+        if: env.PACMAN_REPO_TOKEN != ''
+        env:
+          GPG_KEY: ${{ secrets.PACMAN_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$GPG_KEY" ]; then
+            echo "::error::PACMAN_REPO_TOKEN is set but PACMAN_GPG_PRIVATE_KEY is not" >&2
+            exit 1
+          fi
+          printf '%s\n' "$GPG_KEY" | gpg --batch --import
+          gpg --list-secret-keys --with-colons \
+            | awk -F: '/^sec:/ { print $5; exit }' > /tmp/keyid
+          test -s /tmp/keyid
+
+      - name: Add the packages to the pool
+        if: env.PACMAN_REPO_TOKEN != ''
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${PACMAN_REPO_TOKEN}@github.com/apiplant/pacman.git" repo
+
+          mkdir -p repo/x86_64
+          cp dist/*.pkg.tar.zst repo/x86_64/
+
+      - name: Sign, index and publish
+        if: env.PACMAN_REPO_TOKEN != ''
+        working-directory: repo
+        env:
+          GPG_PASSPHRASE: ${{ secrets.PACMAN_GPG_PASSPHRASE }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          keyid=$(cat /tmp/keyid)
+
+          sign() {
+            rm -f "$1.sig"
+            if [ -n "$GPG_PASSPHRASE" ]; then
+              gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+                --local-user "$keyid" --detach-sign "$1"
+            else
+              gpg --batch --yes --local-user "$keyid" --detach-sign "$1"
+            fi
+          }
+
+          pkgs=$(printf '%s\n' "$PWD/x86_64"/*.pkg.tar.zst)
+          for pkg in $pkgs; do
+            sign "$pkg"
+          done
+
+          repo-add --include-sigs "x86_64/apiplant.db.tar.zst" $pkgs
+
+          # repo-add leaves apiplant.db and apiplant.files as symlinks to the
+          # .tar.zst files. git stores a symlink as its target path, and GitHub
+          # Pages serves that back as a plain text file — so `pacman -Sy` would
+          # download the string "apiplant.db.tar.zst" instead of a database.
+          # Real copies are what gets committed.
+          for name in apiplant.db apiplant.files; do
+            cp --remove-destination "x86_64/$name.tar.zst" "x86_64/$name"
+          done
+
+          sign "x86_64/apiplant.db"
+          sign "x86_64/apiplant.files"
+
+          rm -f apiplant.gpg
+          gpg --armor --export "$keyid" > apiplant.gpg
+          touch .nojekyll
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "h3-rs $version"
+          git push

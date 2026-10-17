@@ -1,0 +1,27 @@
+# Maintainer: apiplant <releases@apiplant.com>
+#
+# Built by the release workflow, which fills in the version and checksum and
+# publishes the resulting package to apiplant.github.io/pacman. It is not an
+# AUR manifest: it installs the binary the release already built.
+pkgname=h3-rs
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="MiniMax H3 video with stereo audio on NVIDIA GPUs (Rust, CUDA)"
+arch=('x86_64')
+url="https://github.com/apiplant/h3-rs"
+license=('Apache-2.0')
+depends=('nvidia-utils' 'cuda' 'ffmpeg')
+# The release archive holding the binary and the README. The workflow builds
+# the package before the release exists and drops the archive next to this
+# file, which makepkg picks up instead of downloading; the URL is what makes
+# the PKGBUILD work on its own once the release is published.
+source=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/@ARCHIVE_PREFIX@-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+sha256sums=('@SHA_LINUX_X86_64@')
+# The dist profile already strips symbols.
+options=('!strip' '!debug')
+
+package() {
+  local src="$srcdir/@ARCHIVE_PREFIX@-v$pkgver-x86_64-unknown-linux-gnu"
+  install -Dm755 "$src/h3" "$pkgdir/usr/bin/h3"
+  install -Dm644 "$src/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

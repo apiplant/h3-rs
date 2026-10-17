@@ -1,0 +1,13 @@
+# --preset Minimal
+[memory]
+dit_gpu_blocks = 0
+te_gpu_layers = 0
+offload = "disk"
+sequential = true
+token_chunk = 2048
+mlp_chunk = 512
+reserve_gb = 6.0
+vae_tile_batch = 1
+vae_resident = false
+vae_dtype = "f16"
+

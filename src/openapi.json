@@ -1,0 +1,126 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "h3 serve",
+    "version": "VERSION",
+    "description": "MiniMax H3 text/image/reference to video with stereo audio over HTTP. The GPU engine is single-tenant: requests queue and run one at a time, and a request returns when its video is finished.\n\nVideo is `video/mp4` (H.264 + AAC) at 24 fps. Media fields are base64 file contents; a `data:` URL prefix is accepted.",
+    "license": { "name": "Apache-2.0" }
+  },
+  "paths": {
+    "/v1/generate": {
+      "post": {
+        "summary": "Generate a video with audio",
+        "description": "Send JSON, or the prompt itself as a plain body. Without `image`, `last_image` or `width`/`height` the canvas follows `aspect` at `megapixels`; with a keyframe it follows the image's aspect ratio. Sizes snap to multiples of 32 and frame counts to the model's 17k+5 grid at 24 fps. Poll `GET /v1/status` for progress while this request is open.",
+        "operationId": "generate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GenerateRequest" },
+              "examples": {
+                "text": { "summary": "Text to video", "value": { "prompt": "A red fox trots through fresh snow at dawn, crunching footsteps.", "seconds": 5, "seed": 3 } },
+                "portrait": { "summary": "Vertical, small and fast", "value": { "prompt": "A street musician plays violin in the rain.", "aspect": "9:16", "megapixels": 0.25, "steps": 8, "lora": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" } },
+                "reference": { "summary": "Reference to video", "value": { "prompt": "<Picture 1> walks through the scene, speaking with the voice of <Audio 1>", "ref_images": ["data:image/png;base64,..."], "ref_audios": ["data:audio/wav;base64,..."] } }
+              }
+            },
+            "text/plain": { "schema": { "type": "string" }, "example": "A red fox trots through snow" }
+          }
+        },
+        "responses": {
+          "200": { "description": "The finished video.", "content": { "video/mp4": { "schema": { "type": "string", "format": "binary" } } } },
+          "400": { "$ref": "#/components/responses/Error" },
+          "503": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/v1/info": {
+      "get": {
+        "summary": "Models, defaults and available LoRAs",
+        "operationId": "info",
+        "responses": {
+          "200": { "description": "Server configuration.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Info" } } } }
+        }
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "summary": "What the engine is doing right now",
+        "description": "Cheap enough to poll every few hundred milliseconds. `done`/`total` count denoising steps while `stage` is `sampling` and VAE chunks while it is `decoding`; other stages have `total` 0.",
+        "operationId": "status",
+        "responses": {
+          "200": { "description": "Current state.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Status" }, "example": { "state": "running", "queued": 1, "stage": "sampling", "done": 6, "total": 8 } } } }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Liveness",
+        "operationId": "health",
+        "responses": { "200": { "description": "The server is up.", "content": { "text/plain": { "schema": { "type": "string" }, "example": "ok\n" } } } }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "Error": { "description": "A plain-text error message.", "content": { "text/plain": { "schema": { "type": "string" } } } }
+    },
+    "schemas": {
+      "GenerateRequest": {
+        "type": "object",
+        "required": ["prompt"],
+        "additionalProperties": false,
+        "properties": {
+          "prompt": { "type": "string", "description": "What to generate. Reference tags `<Picture 1>`, `<Video 1>` and `<Audio 1>` refer to the media in `ref_images`, `ref_videos` and `ref_audios`, numbered per type." },
+          "width": { "type": "integer", "description": "Canvas width in pixels (snapped to 32)." },
+          "height": { "type": "integer", "description": "Canvas height in pixels (snapped to 32)." },
+          "megapixels": { "type": "number", "default": 1.0, "description": "Canvas area in units of 1024², used with `aspect` or a keyframe." },
+          "aspect": { "type": "string", "examples": ["16:9", "9:16", "1:1"], "description": "Aspect ratio when there is no keyframe." },
+          "seconds": { "type": "number", "default": 5.17, "maximum": 30, "description": "Duration. Takes precedence over `length`." },
+          "length": { "type": "integer", "default": 124, "description": "Frame count at 24 fps." },
+          "steps": { "type": "integer", "description": "Sampling steps (server default, 20 unless started with `--steps`)." },
+          "seed": { "type": "integer", "description": "Noise seed; random when omitted. The same seed gives ComfyUI's starting latent." },
+          "sampler": { "type": "string", "enum": ["res_multistep", "euler"], "default": "res_multistep" },
+          "shift_video": { "type": "number", "default": 12.0 },
+          "shift_audio": { "type": "number", "default": 3.0 },
+          "image": { "type": "string", "description": "First keyframe (base64 image)." },
+          "last_image": { "type": "string", "description": "Last keyframe (base64 image)." },
+          "fit": { "type": "string", "enum": ["stretch", "crop"], "description": "How keyframes are fitted to the canvas." },
+          "ref_images": { "type": "array", "items": { "type": "string" }, "description": "Reference images (base64). Cannot be combined with keyframes." },
+          "ref_videos": { "type": "array", "items": { "type": "string" }, "description": "Reference videos (base64 MP4); their soundtrack becomes the matching `<Audio j>`." },
+          "ref_video_mute": { "type": "boolean", "default": false, "description": "Ignore the soundtracks of the reference videos." },
+          "ref_audios": { "type": "array", "items": { "type": "string" }, "description": "Reference audio, e.g. a voice to speak with (base64)." },
+          "ref_image_size": { "type": "string", "enum": ["match", "max"], "default": "match", "description": "`max` keeps references at a 2048 px short edge: best identity fidelity, slower." },
+          "lora": { "type": "string", "description": "LoRA file name from `GET /v1/info`; `\"none\"` disables the server's default LoRA." },
+          "lora_strength": { "type": "number", "default": 1.0 },
+          "crf": { "type": "integer", "default": 18, "description": "H.264 quality, lower is better." }
+        }
+      },
+      "Info": {
+        "type": "object",
+        "properties": {
+          "version": { "type": "string" },
+          "dit": { "type": "string" },
+          "ref_dit": { "type": ["string", "null"], "description": "The reference-to-video checkpoint, when installed." },
+          "text_encoder": { "type": "string" },
+          "video_vae": { "type": "string" },
+          "audio_vae": { "type": "string" },
+          "default_steps": { "type": "integer" },
+          "default_lora": { "type": ["string", "null"] },
+          "loras": { "type": "array", "items": { "type": "string" }, "description": "LoRA files the server can load." },
+          "memory": { "type": "object", "description": "The memory configuration in effect." },
+          "queued": { "type": "integer", "description": "Requests waiting or running." }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "properties": {
+          "state": { "type": "string", "enum": ["idle", "starting", "running"] },
+          "queued": { "type": "integer", "description": "Requests waiting or running." },
+          "stage": { "type": "string", "enum": ["idle", "encoding", "sampling", "decoding", "muxing"] },
+          "done": { "type": "integer" },
+          "total": { "type": "integer" }
+        }
+      }
+    }
+  }
+}

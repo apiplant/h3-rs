@@ -1,0 +1,13 @@
+# --preset Gb8
+[memory]
+dit_gpu_blocks = 0
+te_gpu_layers = 4
+offload = "disk"
+sequential = true
+token_chunk = 4096
+mlp_chunk = 1024
+reserve_gb = 6.0
+vae_tile_batch = 1
+vae_resident = true
+vae_dtype = "f16"
+

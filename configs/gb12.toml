@@ -1,0 +1,13 @@
+# --preset Gb12
+[memory]
+dit_gpu_blocks = 4
+te_gpu_layers = 16
+offload = "ram"
+sequential = true
+token_chunk = 8192
+mlp_chunk = 2048
+reserve_gb = 6.0
+vae_tile_batch = 1
+vae_resident = true
+vae_dtype = "f16"
+

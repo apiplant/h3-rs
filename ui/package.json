@@ -1,0 +1,23 @@
+{
+  "name": "h3-rs-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "The web UI `h3 serve` embeds and serves at /.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solidjs/web": "2.0.0-rc.15",
+    "solid-js": "2.0.0-rc.15"
+  },
+  "devDependencies": {
+    "@solidjs/vite-plugin": "3.0.0-next.50",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3"
+  }
+}
