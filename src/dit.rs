@@ -436,7 +436,7 @@ impl Dit {
         let lora_bytes = lora.map(|(l, _)| l.device_bytes()).unwrap_or(0);
         let resident = resolve_resident(mem.dit_gpu_blocks, cfg.layers, block_bytes, (mem.reserve_gb * 1e9) as usize + lora_bytes + 2_000_000_000);
         log::info(&format!(
-            "DiT: {resident}/{} blocks resident on GPU ({:.1} GB), rest streamed from {:?}",
+            "DiT: {resident}/{} blocks resident on GPU ({:.1} GB), rest streamed from {}",
             cfg.layers,
             (resident * block_bytes) as f64 / 1e9,
             mem.offload

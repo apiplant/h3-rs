@@ -148,6 +148,16 @@ pub enum Placement {
     Disk,
 }
 
+impl std::fmt::Display for Placement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Placement::Gpu => "GPU",
+            Placement::Ram => "RAM",
+            Placement::Disk => "disk",
+        })
+    }
+}
+
 /// A tensor held according to a [`Placement`]; `get` always returns it on the compute device.
 #[derive(Clone)]
 pub enum Held {

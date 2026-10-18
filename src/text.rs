@@ -206,7 +206,7 @@ impl TextEncoder {
             .sum();
         let resident = resolve_resident(mem.te_gpu_layers, n_layers, layer_bytes, (mem.reserve_gb * 0.5e9) as usize);
         log::info(&format!(
-            "text encoder: Qwen3-VL {n_layers} layers, {resident} resident ({:.1} GB), rest from {:?}",
+            "text encoder: Qwen3-VL {n_layers} layers, {resident} resident ({:.1} GB), rest from {}",
             (resident * layer_bytes) as f64 / 1e9,
             mem.te_offload.unwrap_or(mem.offload)
         ));

@@ -50,6 +50,20 @@ cargo install h3-rs --features serve
 
 Then put the ComfyUI MiniMax H3 files in a `models/` folder and run `H3_MODELS_DIR=~/ComfyUI/models h3 serve`.
 
+## Models
+
+h3 loads the ComfyUI MiniMax H3 files and looks for them, in order, in `--models-dir` (`H3_MODELS_DIR`), `./models`,
+`~/ComfyUI/models`, then `~/.cache/h3-rs/models`. Nothing is downloaded. If your ComfyUI install is elsewhere, link it
+into the cache:
+
+```sh
+mkdir -p ~/.cache/h3-rs
+ln -s /path/to/ComfyUI/models ~/.cache/h3-rs/models
+```
+
+Only the files in the table at the top are read (`diffusion_models/`, `text_encoders/`, `vae/`, and optionally
+`loras/`), so a full ComfyUI `models/` folder works as is.
+
 ## Build
 
 Needs CUDA 13.x, ffmpeg, Rust 1.97 or newer. `.cargo/config.toml` pins `CUDARC_CUDA_VERSION=13040`.
