@@ -7,7 +7,10 @@
 //! - `POST /v1/generate`: JSON `{"prompt": ..., "width", "height", "megapixels", "aspect": "9:16", "seconds",
 //!   "length", "steps", "seed", "sampler": "res_multistep"|"euler", "shift_video", "shift_audio",
 //!   "image": b64, "last_image": b64, "fit": "stretch"|"crop", "ref_images": [b64], "ref_videos": [b64],
-//!   "ref_video_mute", "ref_audios": [b64], "ref_image_size": "match"|"max", "lora": name,
+//!   "ref_video_mute", "ref_audios": [b64], "ref_image_size": "match"|"max",
+//!   "guides": [{"kind": "image"|"audio", "data": b64, "frame": 0}], "source": b64, "source_mute", "mask": b64,
+//!   "mask_audio": "follow"|"keep"|"generate", "controlnet": name, "control_video": b64, "control_strength",
+//!   "control_start", "control_end", "lora": name,
 //!   "lora_strength", "upscale", "upscale_split", "crf"}` (only `prompt` is required; media fields are base64 file contents, a
 //!   `data:` URL prefix is accepted). Returns `video/mp4`. A plain-text body is taken as the prompt.
 //! - `GET /v1/info`: models, memory settings, available LoRAs, queue length. `GET /v1/status`: what the engine is
@@ -27,7 +30,8 @@ use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-use crate::pipeline::{Engine, Fit, RefImageSize, RefInput, Request, Upscale};
+use crate::inpaint::MaskAudio;
+use crate::pipeline::{ControlRequest, Engine, Fit, Guide, GuideKind, RefImageSize, RefInput, Request, Upscale};
 use crate::sampling::Sampler;
 
 /// Request defaults (from the `serve` command line).
@@ -36,6 +40,20 @@ pub struct Defaults {
     pub steps: usize,
     pub lora: Option<(String, f64)>,
     pub loras_dir: PathBuf,
+    /// Fun ControlNet checkpoints (`models/model_patches`).
+    pub patches_dir: PathBuf,
+}
+
+/// One `MiniMaxH3AddGuide`: an image, clip or audio file anchored at a frame.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuideIn {
+    /// "image" (a picture or a video clip, default) or "audio"
+    kind: Option<String>,
+    /// base64 file contents
+    data: String,
+    /// start frame; negative counts from the end (default 0)
+    frame: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -65,6 +83,22 @@ struct GenRequest {
     #[serde(default)]
     ref_audios: Vec<String>,
     ref_image_size: Option<String>,
+    #[serde(default)]
+    guides: Vec<GuideIn>,
+    /// video (or image) to edit under `mask`
+    source: Option<String>,
+    #[serde(default)]
+    source_mute: bool,
+    /// denoise mask over `source`: image or video, white = regenerate
+    mask: Option<String>,
+    /// "follow" (default), "keep" or "generate"
+    mask_audio: Option<String>,
+    /// Fun ControlNet checkpoint name in models/model_patches
+    controlnet: Option<String>,
+    control_video: Option<String>,
+    control_strength: Option<f64>,
+    control_start: Option<f64>,
+    control_end: Option<f64>,
     /// LoRA file name in models/loras ("" or "none" disables the server default)
     lora: Option<String>,
     lora_strength: Option<f64>,
@@ -134,6 +168,39 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
     for b in &g.ref_audios {
         refs.push(RefInput::Audio(save(b, "audio")?));
     }
+    let mut guides = vec![];
+    for gi in &g.guides {
+        let kind = match gi.kind.as_deref() {
+            None | Some("image") | Some("video") => GuideKind::Visual,
+            Some("audio") => GuideKind::Audio,
+            Some(k) => anyhow::bail!("guide kind must be image or audio, got {k}"),
+        };
+        guides.push(Guide { path: save(&gi.data, "bin")?, frame: gi.frame.unwrap_or(0), kind });
+    }
+    let source = g.source.as_deref().map(|b| save(b, "bin")).transpose()?;
+    let mask = g.mask.as_deref().map(|b| save(b, "bin")).transpose()?;
+    let mask_audio = match g.mask_audio.as_deref() {
+        None | Some("follow") => MaskAudio::Follow,
+        Some("keep") => MaskAudio::Keep,
+        Some("generate") => MaskAudio::Generate,
+        Some(v) => anyhow::bail!("mask_audio must be follow, keep or generate, got {v}"),
+    };
+    let control = match g.controlnet.as_deref() {
+        None | Some("") | Some("none") => None,
+        Some(name) => {
+            let model = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { d.patches_dir.join(name) };
+            if !model.is_file() {
+                anyhow::bail!("ControlNet {name} not found in {}", d.patches_dir.display());
+            }
+            Some(ControlRequest {
+                model,
+                video: g.control_video.as_deref().map(|b| save(b, "bin")).transpose()?,
+                strength: g.control_strength.unwrap_or(1.0),
+                start: g.control_start.unwrap_or(0.0),
+                end: g.control_end.unwrap_or(1.0),
+            })
+        }
+    };
     let lora = match g.lora.as_deref() {
         Some("") | Some("none") => None,
         Some(name) => {
@@ -191,7 +258,12 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
         first_frame,
         last_frame,
         lora,
-        audio_guide: None,
+        guides,
+        source,
+        source_mute: g.source_mute,
+        mask,
+        mask_audio,
+        control,
         upscale: g.upscale.filter(|s| *s != 0.0 && *s != 1.0).map(|scale| Upscale { scale, split: g.upscale_split.unwrap_or(0.5) }),
         output: dir.join("out.mp4").display().to_string(),
         save_latents: None,
@@ -387,6 +459,7 @@ async fn serve(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, addr: Str
                 let mut i = info.clone();
                 i["queued"] = serde_json::json!(p2.load(Ordering::Relaxed));
                 i["loras"] = serde_json::json!(list_loras(&loras_dir));
+                i["controlnets"] = serde_json::json!(list_loras(&loras_dir.with_file_name("model_patches")));
                 async move { HttpResponse::Ok().json(&i) }
             })))
             .service(web::resource("/v1/status").route(web::get().to(move || {

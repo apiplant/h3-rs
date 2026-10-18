@@ -147,10 +147,41 @@ enum Cmd {
         /// Last keyframe image (fl2va).
         #[arg(long)]
         last_image: Option<String>,
-        /// Audio anchored at frame 0 (speech for a talking image, music...). Use with --image; set
-        /// --seconds to the audio length.
+        /// Image or clip anchored at a frame, `PATH[@FRAME]` (repeatable; ComfyUI MiniMaxH3AddGuide). A video
+        /// file is cut to 5, 22, 39... (17k+5) frames; FRAME defaults to 0 and counts from the end if negative.
         #[arg(long)]
-        audio_guide: Option<String>,
+        guide: Vec<String>,
+        /// Audio anchored at a frame, `PATH[@FRAME]` (repeatable): speech for a talking image, music... Cropped
+        /// to the video's remaining duration; set --seconds to its length. A video file gives its soundtrack.
+        #[arg(long, alias = "audio-guide")]
+        guide_audio: Vec<String>,
+        /// Video (or image) to edit with --mask: the cells the mask keeps come from it, along with its soundtrack.
+        #[arg(long, requires = "mask")]
+        source: Option<String>,
+        /// Ignore the source's soundtrack (the audio is then generated).
+        #[arg(long)]
+        source_mute: bool,
+        /// Denoise mask over --source: an image or video, white = regenerate, black = keep, grey = partly.
+        #[arg(long, requires = "source")]
+        mask: Option<String>,
+        /// What the mask does to the source's audio.
+        #[arg(long, value_enum, default_value = "follow")]
+        mask_audio: h3_rs::inpaint::MaskAudio,
+        /// Fun ControlNet checkpoint (models/model_patches): steers the video with --control-video and/or the
+        /// --source + --mask pair as an inpainting hint.
+        #[arg(long)]
+        controlnet: Option<String>,
+        /// Control video for --controlnet (depth, pose, edges...).
+        #[arg(long, requires = "controlnet")]
+        control_video: Option<String>,
+        #[arg(long, default_value_t = 1.0, requires = "controlnet")]
+        control_strength: f64,
+        /// Share of the sampling at which the ControlNet starts (0 = first step).
+        #[arg(long, default_value_t = 0.0, requires = "controlnet")]
+        control_start: f64,
+        /// Share of the sampling at which the ControlNet stops (1 = last step).
+        #[arg(long, default_value_t = 1.0, requires = "controlnet")]
+        control_end: f64,
         /// LoRA file (path, or name in models/loras).
         #[arg(long)]
         lora: Option<String>,
@@ -266,7 +297,17 @@ fn main() -> Result<()> {
             shift_audio,
             image,
             last_image,
-            audio_guide,
+            guide,
+            guide_audio,
+            source,
+            source_mute,
+            mask,
+            mask_audio,
+            controlnet,
+            control_video,
+            control_strength,
+            control_start,
+            control_end,
             lora,
             lora_strength,
             upscale,
@@ -303,6 +344,18 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
+            let guides: Vec<pipeline::Guide> = guide
+                .iter()
+                .map(|g| pipeline::Guide::parse(g, pipeline::GuideKind::Visual))
+                .chain(guide_audio.iter().map(|g| pipeline::Guide::parse(g, pipeline::GuideKind::Audio)))
+                .collect();
+            let control = controlnet.map(|c| pipeline::ControlRequest {
+                model: if std::path::Path::new(&c).is_file() { c.into() } else { models.models_dir.join("model_patches").join(c) },
+                video: control_video,
+                strength: control_strength,
+                start: control_start,
+                end: control_end,
+            });
             let length = seconds.map(|s| (s * pipeline::FPS as f64).round() as usize).unwrap_or(length);
             let req = Request {
                 prompt,
@@ -322,7 +375,12 @@ fn main() -> Result<()> {
                 first_frame: image,
                 last_frame: last_image,
                 lora,
-                audio_guide,
+                guides,
+                source,
+                source_mute,
+                mask,
+                mask_audio,
+                control,
                 upscale: upscale.map(|scale| pipeline::Upscale { scale, split: upscale_split }),
                 output,
                 save_latents,
@@ -355,7 +413,7 @@ fn main() -> Result<()> {
                 "default_steps": steps, "default_lora": lora.as_ref().map(|l| l.0.clone()),
                 "memory": memc,
             });
-            let defaults = h3_rs::serve::Defaults { steps, lora: lora.clone(), loras_dir };
+            let defaults = h3_rs::serve::Defaults { steps, lora: lora.clone(), loras_dir, patches_dir: models.models_dir.join("model_patches") };
             let device = mem.device;
             h3_rs::serve::run(
                 move || {

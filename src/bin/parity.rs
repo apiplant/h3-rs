@@ -66,12 +66,25 @@ fn main() -> Result<()> {
                     seed: 0,
                     visual_cond_noise_aug: h3_rs::dit::VISUAL_COND_TIMESTEP,
                     audio_cond_noise_aug: h3_rs::dit::AUDIO_COND_TIMESTEP,
+                    denoise: None,
+                    control: None,
                 };
                 let run = dit.prepare(&cond, v.dims(), a.dim(3)?, vec![])?;
                 let sigma = r.load("sigma", &Device::Cpu)?.to_vec1::<f32>()?[0] as f64;
                 let (ov, oa) = dit.forward(&run, &v, &a, sigma)?;
                 report("dit out video", &ov, &r.load("out_v", &dev)?)?;
                 report("dit out audio", &oa, &r.load("out_a", &dev)?)?;
+                if r.has("mask_v") {
+                    // under a denoise mask: per-row timesteps and scaled velocity
+                    let flat = |t: Tensor| -> Result<Vec<f32>> { Ok(t.flatten_all()?.to_vec1::<f32>()?) };
+                    let mv = flat(r.load("mask_v", &Device::Cpu)?)?;
+                    let ma = flat(r.load("mask_a", &Device::Cpu)?.narrow(2, 0, 1)?)?;
+                    let masked = h3_rs::dit::DitCond { denoise: Some(h3_rs::dit::TokenMasks { video: Some(mv), audio: Some(ma) }), ..cond.clone() };
+                    let run = dit.prepare(&masked, v.dims(), a.dim(3)?, vec![])?;
+                    let (ov, oa) = dit.forward(&run, &v, &a, sigma)?;
+                    report("dit out video (masked)", &ov, &r.load("out_mv", &dev)?)?;
+                    report("dit out audio (masked)", &oa, &r.load("out_ma", &dev)?)?;
+                }
                 for (i, t) in dit.captured.borrow().iter() {
                     let rf = r.load(&format!("block{i}"), &dev)?;
                     report(&format!("block {i} out"), t, &rf)?;

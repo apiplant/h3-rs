@@ -5,6 +5,7 @@ use anyhow::Result;
 use candle_core::Tensor;
 
 use crate::dit::{Dit, DitRun};
+use crate::inpaint::Inpaint;
 
 pub fn time_snr_shift(alpha: f64, t: f64) -> f64 {
     if alpha == 1.0 {
@@ -31,8 +32,8 @@ pub enum Sampler {
 
 /// Run the sampler over the packed (video, carried audio) latent. `on_step(i, n)` is called
 /// after each step.
-pub fn sample(dit: &Dit, run: &DitRun, xv: Tensor, xa: Tensor, sigmas: &[f64], sampler: Sampler, on_step: impl FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
-    let s = sample_denoised(dit, run, xv, xa, sigmas, sampler, on_step)?;
+pub fn sample(dit: &Dit, run: &DitRun, xv: Tensor, xa: Tensor, sigmas: &[f64], sampler: Sampler, inpaint: Option<&Inpaint>, on_step: impl FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
+    let s = sample_denoised(dit, run, xv, xa, sigmas, sampler, inpaint, on_step)?;
     Ok((s.xv, s.xa))
 }
 
@@ -46,7 +47,9 @@ pub struct Sampled {
     pub denoised_a: Tensor,
 }
 
-/// [`sample`], also returning the last denoised prediction.
+/// [`sample`], also returning the last denoised prediction. With `inpaint`, kept regions of a source are injected
+/// before each model call and restored in its prediction (ComfyUI's `KSamplerX0Inpaint`).
+#[allow(clippy::too_many_arguments)]
 pub fn sample_denoised(
     dit: &Dit,
     run: &DitRun,
@@ -54,6 +57,7 @@ pub fn sample_denoised(
     mut xa: Tensor,
     sigmas: &[f64],
     sampler: Sampler,
+    inpaint: Option<&Inpaint>,
     mut on_step: impl FnMut(usize, usize),
 ) -> Result<Sampled> {
     let mut old: Option<(Tensor, Tensor)> = None;
@@ -62,10 +66,25 @@ pub fn sample_denoised(
     let mut last: Option<(Tensor, Tensor)> = None;
     for i in 0..n {
         let (s, s_next) = (sigmas[i], sigmas[i + 1]);
-        let (ov, oa) = dit.forward(run, &xv, &xa, s)?;
-        // CONST: denoised = x - out * sigma
-        let dv = (&xv - (&ov * s)?)?;
-        let da = (&xa - (&oa * s)?)?;
+        let (ov, oa, dv, da);
+        match inpaint {
+            None => {
+                (ov, oa) = dit.forward(run, &xv, &xa, s)?;
+                // CONST: denoised = x - out * sigma
+                dv = (&xv - (&ov * s)?)?;
+                da = (&xa - (&oa * s)?)?;
+            }
+            Some(ip) => {
+                let (iv, ia) = ip.inject(&xv, &xa, s)?;
+                let (fv, fa) = dit.forward(run, &iv, &ia, s)?;
+                let (mv, ma) = ip.merge(&(&iv - (&fv * s)?)?, &(&ia - (&fa * s)?)?)?;
+                // the update follows the restored prediction: d = (x - denoised) / sigma
+                ov = ((&xv - &mv)? / s)?;
+                oa = ((&xa - &ma)? / s)?;
+                dv = mv;
+                da = ma;
+            }
+        }
         let euler = sampler == Sampler::Euler || s_next == 0.0 || old.is_none();
         if euler {
             xv = (&xv + (&ov * (s_next - s))?)?;

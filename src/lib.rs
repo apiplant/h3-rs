@@ -2,7 +2,9 @@
 
 pub mod attn8;
 pub mod config;
+pub mod control;
 pub mod dit;
+pub mod inpaint;
 pub mod kernels;
 pub mod lora;
 pub mod media;

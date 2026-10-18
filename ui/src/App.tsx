@@ -8,7 +8,14 @@ import {
 } from "./styles";
 import { Icon, Logo, Ratio, Segmented, Slider, Toggle } from "./ui";
 
-type Mode = "text" | "frames" | "refs";
+type Mode = "text" | "frames" | "refs" | "edit";
+
+/** A MiniMaxH3AddGuide: a picture, clip or soundtrack anchored at a frame. */
+interface Guide {
+  p: Picked;
+  kind: "image" | "video" | "audio";
+  frame: number;
+}
 
 interface Take {
   id: number;
@@ -267,6 +274,15 @@ export function App() {
   const [refImgs, setRefImgs] = createSignal<Picked[]>([]);
   const [refVids, setRefVids] = createSignal<Picked[]>([]);
   const [refAuds, setRefAuds] = createSignal<Picked[]>([]);
+  const [guides, setGuides] = createSignal<Guide[]>([]);
+  const [src, setSrc] = createSignal<Picked | null>(null);
+  const [maskF, setMaskF] = createSignal<Picked | null>(null);
+  const [srcMute, setSrcMute] = createSignal(false);
+  const [maskAudio, setMaskAudio] = createSignal<"follow" | "keep" | "generate">("follow");
+  const [cnet, setCnet] = createSignal("");
+  const [ctlVideo, setCtlVideo] = createSignal<Picked | null>(null);
+  const [ctlStrength, setCtlStrength] = createSignal(1);
+  const [ctlRange, setCtlRange] = createSignal<[number, number]>([0, 1]);
 
   const [busy, setBusy] = createSignal(false);
   const [elapsed, setElapsed] = createSignal(0);
@@ -386,6 +402,22 @@ export function App() {
       if (lora() !== "none") req.lora_strength = loraStrength();
     }
     const m = mode();
+    if (m !== "refs" && guides().length) {
+      req.guides = await Promise.all(guides().map(async (g) => ({ kind: g.kind === "audio" ? ("audio" as const) : ("image" as const), data: await dataUrl(g.p.file), frame: Math.trunc(g.frame) })));
+    }
+    if (m === "edit") {
+      req.source = await dataUrl(src()!.file);
+      req.mask = await dataUrl(maskF()!.file);
+      req.source_mute = srcMute();
+      req.mask_audio = maskAudio();
+      if (cnet()) {
+        req.controlnet = cnet();
+        if (ctlVideo()) req.control_video = await dataUrl(ctlVideo()!.file);
+        req.control_strength = ctlStrength();
+        req.control_start = ctlRange()[0];
+        req.control_end = ctlRange()[1];
+      }
+    }
     if (m === "frames") {
       if (first()) req.image = await dataUrl(first()!.file);
       if (last()) req.last_image = await dataUrl(last()!.file);
@@ -478,7 +510,7 @@ export function App() {
     return { cls: "bg-ok shadow-[0_0_8px_var(--color-ok)]", label: "Engine ready" };
   };
 
-  const modeNeedsMedia = () => (mode() === "refs" && !refImgs().length && !refVids().length && !refAuds().length) || (mode() === "frames" && !first() && !last());
+  const modeNeedsMedia = () => (mode() === "refs" && !refImgs().length && !refVids().length && !refAuds().length) || (mode() === "frames" && !first() && !last()) || (mode() === "edit" && (!src() || !maskF()));
 
   return (
     <div class="flex min-h-full flex-col lg:h-full">
@@ -515,13 +547,14 @@ export function App() {
             <span class={panelTitle}>Compose</span>
             <div class="flex-1" />
             <Segmented
-              class="!w-[236px]"
+              class="!w-[300px]"
               value={mode()}
               onChange={(v) => setMode(v)}
               options={[
                 { value: "text", label: "Text", hint: "Prompt only" },
                 { value: "frames", label: "Frames", hint: "Start from a first and/or last image" },
-                { value: "refs", label: "References", hint: "Pictures, videos and voices to use in the scene", },
+                { value: "refs", label: "Refs", hint: "Pictures, videos and voices to use in the scene" },
+                { value: "edit", label: "Edit", hint: "Regenerate part of a video under a mask, optionally steered by a Fun ControlNet" },
               ]}
             />
           </div>
@@ -614,6 +647,147 @@ export function App() {
               </div>
             </Show>
 
+
+            <Show when={mode() === "edit"}>
+              <div class="flex flex-col gap-3.5 border-t border-ink-750 p-3.5">
+                <div class="grid grid-cols-2 gap-2.5">
+                  <For each={[{ k: "Source video", kind: "video" as const, get: src, set: setSrc, icon: "film" }, { k: "Mask (white = redo)", kind: "video" as const, get: maskF, set: setMaskF, icon: "layers" }]}>
+                    {(slot) => (
+                      <Show
+                        when={slot.get()}
+                        fallback={
+                          <Drop
+                            accept="video/*,image/*"
+                            onFiles={(f) => add(f[0]?.type.startsWith("image/") ? "image" : "video", f, (p) => slot.set(p[0] ?? null))}
+                            class="grid aspect-video place-items-center rounded-lg border border-dashed border-ink-600 text-ink-400 hover:border-ink-500 hover:text-ink-200"
+                          >
+                            <span class="text-center text-xs leading-snug">
+                              <Icon name={slot.icon} size={18} class="mx-auto mb-1" />
+                              {slot.k}
+                              <span class="block text-[11px] text-ink-500">click or drop</span>
+                            </span>
+                          </Drop>
+                        }
+                      >
+                        {(p) => (
+                          <Thumb
+                            p={p()}
+                            kind={p().file.type.startsWith("image/") ? "image" : "video"}
+                            class="aspect-video"
+                            tag={slot.k}
+                            onRemove={() => {
+                              drop(p());
+                              slot.set(null);
+                            }}
+                          />
+                        )}
+                      </Show>
+                    )}
+                  </For>
+                </div>
+                <p class="text-xs leading-snug text-ink-500">
+                  The mask is an image or a video: white regenerates, black keeps the source, grey is partly. The video must be at least as long as the duration.
+                </p>
+                <div>
+                  <div class={sectionLabel}>Soundtrack</div>
+                  <Segmented
+                    value={maskAudio()}
+                    onChange={setMaskAudio}
+                    options={[
+                      { value: "follow", label: "Follow mask", hint: "Regenerate the audio over the frames where the mask is set" },
+                      { value: "keep", label: "Keep" },
+                      { value: "generate", label: "Regenerate" },
+                    ]}
+                  />
+                  <Toggle label="Ignore the source's audio" hint="The soundtrack is then fully generated." checked={srcMute()} onChange={setSrcMute} />
+                </div>
+                <Show when={(info()?.controlnets ?? []).length}>
+                  <div>
+                    <div class={sectionLabel}>Fun ControlNet</div>
+                    <div class="relative w-full">
+                      <select class={select} value={cnet()} onChange={(e) => setCnet(e.currentTarget.value)}>
+                        <option value="">None</option>
+                        <For each={info()?.controlnets ?? []}>{(c) => <option value={c}>{c.replace(/\.safetensors$/, "")}</option>}</For>
+                      </select>
+                    </div>
+                    <Show when={cnet()}>
+                      <div class="mt-2.5 flex flex-col gap-2.5">
+                        <Show
+                          when={ctlVideo()}
+                          fallback={
+                            <Drop accept="video/*" onFiles={(f) => add("video", f, (p) => setCtlVideo(p[0] ?? null))} class="grid h-14 place-items-center rounded-lg border border-dashed border-ink-600 text-xs text-ink-400 hover:border-ink-500 hover:text-ink-200">
+                              Control video (depth, pose, edges…) — optional
+                            </Drop>
+                          }
+                        >
+                          {(p) => (
+                            <Thumb p={p()} kind="video" class="aspect-video max-w-[160px]" tag="Control" onRemove={() => { drop(p()); setCtlVideo(null); }} />
+                          )}
+                        </Show>
+                        <Slider label="Strength" value={ctlStrength()} min={0} max={2} step={0.05} digits={2} onChange={setCtlStrength} />
+                        <Slider label="Starts at" value={ctlRange()[0]} min={0} max={1} step={0.05} digits={2} onChange={(v) => setCtlRange([Math.min(v, ctlRange()[1]), ctlRange()[1]])} />
+                        <Slider label="Stops at" value={ctlRange()[1]} min={0} max={1} step={0.05} digits={2} onChange={(v) => setCtlRange([ctlRange()[0], Math.max(v, ctlRange()[0])])} />
+                        <p class="text-xs leading-snug text-ink-500">The source and mask also go to the ControlNet as an inpainting hint.</p>
+                      </div>
+                    </Show>
+                  </div>
+                </Show>
+              </div>
+            </Show>
+
+            <Show when={mode() !== "refs"}>
+              <div class="border-t border-ink-750 p-3.5">
+                <div class={sectionLabel}>
+                  Guides
+                  <span class="font-mono normal-case tracking-normal text-ink-500">{guides().length || ""}</span>
+                </div>
+                <div class="flex flex-col gap-2">
+                  <For each={guides()}>
+                    {(g, i) => (
+                      <div class="flex items-center gap-2">
+                        <Thumb
+                          p={g.p}
+                          kind={g.kind}
+                          class="size-10 shrink-0"
+                          onRemove={() => {
+                            drop(g.p);
+                            setGuides((all) => all.filter((x) => x.p.id !== g.p.id));
+                          }}
+                        />
+                        <span class="min-w-0 flex-1 truncate text-xs text-ink-300" title={g.p.name}>{g.p.name}</span>
+                        <label class="flex items-center gap-1 text-xs text-ink-500">
+                          frame
+                          <input
+                            type="number"
+                            class={`${input} !w-[72px]`}
+                            value={g.frame}
+                            title="Frame the guide starts at; negative counts from the end"
+                            onChange={(e) => setGuides((all) => all.map((x, j) => (j === i() ? { ...x, frame: Math.trunc(Number(e.currentTarget.value)) || 0 } : x)))}
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </For>
+                  <Drop
+                    accept="image/*,video/*,audio/*"
+                    multiple
+                    onFiles={async (files) => {
+                      for (const f of files) {
+                        const kind = f.type.startsWith("audio/") ? "audio" : f.type.startsWith("image/") ? "image" : /^video\/|\.(mp4|mov|webm|mkv)$/i.test(f.type + f.name) ? "video" : null;
+                        if (!kind) continue;
+                        const p = await inspect(f, kind);
+                        setGuides((all) => [...all, { p, kind, frame: 0 }]);
+                      }
+                    }}
+                    class="grid h-10 place-items-center rounded-lg border border-dashed border-ink-600 text-xs text-ink-400 hover:border-ink-500 hover:text-ink-200"
+                  >
+                    Add a picture, clip or voice at a frame
+                  </Drop>
+                </div>
+                <p class="mt-2 text-xs leading-snug text-ink-500">Anchors media at any frame (negative counts from the end). Clips are cut to 5, 22, 39… frames; audio is cropped to the remaining time.</p>
+              </div>
+            </Show>
+
             <Show when={mode() === "refs"}>
               <div class="flex flex-col gap-3.5 border-t border-ink-750 p-3.5">
                 <For
@@ -684,7 +858,7 @@ export function App() {
             <Show
               when={busy()}
               fallback={
-                <button class={`${btnPrimary} ${btnLg}`} onClick={run} disabled={!prompt().trim() || !online() || modeNeedsMedia()} title={modeNeedsMedia() ? "Add an image first" : "Ctrl+Enter"}>
+                <button class={`${btnPrimary} ${btnLg}`} onClick={run} disabled={!prompt().trim() || !online() || modeNeedsMedia()} title={modeNeedsMedia() ? "Add the media this mode needs first" : "Ctrl+Enter"}>
                   <Icon name="bolt" size={15} /> Generate
                 </button>
               }

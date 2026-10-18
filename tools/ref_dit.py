@@ -3,7 +3,7 @@
 usage: python tools/ref_dit.py <out_dir>
 Writes:
   dequant.safetensors : dequantized weights (int8 convrot DiT qkv, nvfp4 TE down_proj)
-  dit_fwd.safetensors : inputs + outputs of one MiniMaxH3Model.forward at a tiny shape
+  dit_fwd.safetensors : inputs + outputs of one MiniMaxH3Model.forward at a tiny shape, plain and under a denoise mask
 """
 import os, sys
 sys.path.insert(0, "/mnt/extra/ai/ComfyUI")
@@ -64,7 +64,20 @@ if "dit" in what:
         payload = {"audio_scale": 4.0, "seed": 0}
         o = dm.forward([v.to(dev), a.to(dev)], torch.tensor([sigma * 1000.0], device=dev), text,
                        transformer_options={}, minimax_payload=payload)
+    # the same forward under a denoise mask (token-grid values: 0 keeps, 1 generates, 0.5 in between)
+    mv = torch.ones(1, 1, T, H, W)
+    mv[:, :, :, :, :6] = 0.0
+    mv[:, :, 1, :4, 6:] = 0.5
+    ma = torch.ones(1, 1, 2, TA)
+    ma[..., :3] = 0.0
+    ma[..., 3:5] = 0.5
+    with torch.no_grad():
+        om = dm.forward([v.to(dev), a.to(dev)], torch.tensor([sigma * 1000.0], device=dev), text,
+                        transformer_options={}, minimax_payload=payload,
+                        denoise_mask=mv.to(dev), audio_denoise_mask=ma.to(dev))
     save_file({"ctx": ctx.float(), "text_refined": text[0].float().cpu(), "v": v, "a": a,
                "out_v": o[0].float().cpu().contiguous(), "out_a": o[1].float().cpu().contiguous(),
+               "mask_v": mv, "mask_a": ma,
+               "out_mv": om[0].float().cpu().contiguous(), "out_ma": om[1].float().cpu().contiguous(),
                "sigma": torch.tensor([sigma]), **captured}, f"{out}/dit_fwd.safetensors")
     print("dit done", o[0].shape, o[1].shape, o[0].abs().mean().item(), o[1].abs().mean().item())

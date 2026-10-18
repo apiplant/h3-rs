@@ -20,6 +20,17 @@ export interface GenerateRequest {
   ref_audios?: string[];
   ref_video_mute?: boolean;
   ref_image_size?: "match" | "max";
+  /** Images / clips ("image") and soundtracks ("audio") anchored at a frame. */
+  guides?: { kind: "image" | "audio"; data: string; frame: number }[];
+  source?: string;
+  source_mute?: boolean;
+  mask?: string;
+  mask_audio?: "follow" | "keep" | "generate";
+  controlnet?: string;
+  control_video?: string;
+  control_strength?: number;
+  control_start?: number;
+  control_end?: number;
   lora?: string;
   lora_strength?: number;
   /** Sample at 1/N of the size, upscale the latent, refine at full size. */
@@ -39,6 +50,8 @@ export interface Info {
   /** Latent upscaler checkpoint, when the server found one. */
   upscaler: string | null;
   loras: string[];
+  /** Fun ControlNet checkpoints in models/model_patches. */
+  controlnets?: string[];
   queued: number;
 }
 

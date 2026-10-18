@@ -52,7 +52,7 @@ export function DocsServer() {
         />
         <P>
           Request fields: <IC>prompt</IC> (required), <IC>width</IC>, <IC>height</IC>, <IC>megapixels</IC>, <IC>aspect</IC>, <IC>seconds</IC> or <IC>length</IC>, <IC>steps</IC>, <IC>seed</IC>,
-          <IC>sampler</IC>, <IC>shift_video</IC>, <IC>shift_audio</IC>, <IC>image</IC>, <IC>last_image</IC>, <IC>fit</IC>, <IC>ref_images</IC>, <IC>ref_videos</IC>, <IC>ref_audios</IC>, <IC>ref_video_mute</IC>,
+          <IC>sampler</IC>, <IC>shift_video</IC>, <IC>shift_audio</IC>, <IC>image</IC>, <IC>last_image</IC>, <IC>fit</IC>, <IC>ref_images</IC>, <IC>ref_videos</IC>, <IC>ref_audios</IC>, <IC>ref_video_mute</IC>, <IC>guides</IC>, <IC>source</IC>, <IC>source_mute</IC>, <IC>mask</IC>, <IC>mask_audio</IC>, <IC>controlnet</IC>, <IC>control_video</IC>, <IC>control_strength</IC>, <IC>control_start</IC>, <IC>control_end</IC>,
           <IC>ref_image_size</IC>, <IC>lora</IC> (<IC>"none"</IC> turns the server default off), <IC>lora_strength</IC> and <IC>crf</IC>.
         </P>
         <Pre caption="GET /v1/status" lang="json">{`{ "state": "running", "queued": 1, "stage": "sampling", "done": 6, "total": 8 }`}</Pre>

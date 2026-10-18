@@ -11,6 +11,7 @@ files as-is:
 | `vae/minimax_h3_video_vae_fp16.safetensors` (or the int8_convrot variant) | fp16 | `vae_video.rs` |
 | `vae/minimax_h3_audio_vae_fp32.safetensors` | fp32 | `vae_audio.rs` |
 | `loras/*.safetensors` (optional) | ComfyUI LoRA, incl. PDD head-bank `reshape_weight` | `lora.rs` |
+| `model_patches/*.safetensors` (optional) | MiniMax H3 Fun ControlNet (int8 or dense blocks, v1 5 / v2 10 control blocks) | `control.rs` |
 | `latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors` (optional) | fp16 3D-conv latent upscaler ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler), MIT) | `upscaler.rs` |
 
 Quantized weights stay quantized in memory and are dequantized per layer by NVRTC kernels (`kernels.rs`).
@@ -63,7 +64,7 @@ ln -s /path/to/ComfyUI/models ~/.cache/h3-rs/models
 ```
 
 Only the files in the table at the top are read (`diffusion_models/`, `text_encoders/`, `vae/`, and optionally
-`loras/` and `latent_upscale_models/`), so a full ComfyUI `models/` folder works as is.
+`loras/`, `latent_upscale_models/` and `model_patches/`), so a full ComfyUI `models/` folder works as is.
 
 ## Build
 
@@ -88,6 +89,18 @@ h3 generate -p "..." --image first.png --last-image last.png
 # images, then videos (a video's soundtrack is the <Audio j> just before its <Video k>), then --ref-audio files.
 h3 generate -p "<Picture 1> walks through the scene of <Video 1>, speaking with the voice of <Audio 2>" \
     --ref-image person.png --ref-video scene.mp4 --ref-audio voice.wav        # --ref-video-mute, --ref-image-size max
+
+# anchor images, clips and audio at any frame (ComfyUI MiniMaxH3AddGuide): PATH[@FRAME], negative counts from the end.
+# A video file is cut to 5, 22, 39... frames (17k+5); --guide-audio takes audio, or a video's soundtrack. Repeatable.
+h3 generate -p "..." --guide pose.png@40 --guide clip.mp4@-39 --guide-audio voice.wav@12
+
+# edit part of a video (denoise mask: white regenerates, black keeps the source; its soundtrack is kept
+# where the mask is empty, --mask-audio keep|generate overrides)
+h3 generate -p "a red scarf" --source walk.mp4 --mask scarf_mask.mp4 --seconds 4
+
+# Fun ControlNet (models/model_patches/): a control video, and/or the --source + --mask pair as an inpainting hint
+h3 generate -p "..." --controlnet minimax_h3_fun_controlnet.safetensors --control-video depth.mp4 \
+    --control-strength 0.8 --control-end 0.7
 
 # official turbo LoRAs (Comfy-Org/MiniMax-H3 loras/): 8 steps fl2v, 4 steps ref2v
 h3 generate -p "..." --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
@@ -128,7 +141,7 @@ curl -o out.mp4 -H 'content-type: application/json' localhost:8188/v1/generate \
 
 `POST /v1/generate` takes JSON: `prompt` (required), `width`, `height`, `megapixels`, `aspect`, `seconds` or
 `length`, `steps`, `seed`, `sampler`, `shift_video`, `shift_audio`, `image` / `last_image` (base64, `data:` URLs
-accepted), `fit`, `ref_images` / `ref_videos` / `ref_audios` (base64 lists), `ref_video_mute`, `ref_image_size`,
+accepted), `fit`, `guides` (`[{kind: image|audio, data, frame}]`), `source` / `source_mute` / `mask` / `mask_audio`, `controlnet` / `control_video` / `control_strength` / `control_start` / `control_end`, `ref_images` / `ref_videos` / `ref_audios` (base64 lists), `ref_video_mute`, `ref_image_size`,
 `lora` (file name in `models/loras`, `"none"` to disable the server default), `lora_strength`, `upscale` (factor, as `--upscale`) with `upscale_split`, `crf`. It returns
 `video/mp4`. `GET /` is a web studio (text / keyframes / references, live progress, takes; source in `ui/`, embedded in the binary),
 `GET /v1/info` lists models, memory settings, available LoRAs and queue length, `GET /v1/status` reports the stage and
@@ -190,8 +203,21 @@ dequant (int8 exact, NVFP4 bf16-exact), text encoder (token ids and tags identic
 decode (cos 0.999998) / image encode (0.99998) / 22-frame encode (0.99999), audio VAE decode (cos 0.999998) /
 encode (0.99992).
 
+## Guides, masks, ControlNet
+
+- **Guides** (`MiniMaxH3AddGuide`): `--guide PATH[@FRAME]` anchors a picture, or a clip cut down to 17k+5 frames, at a frame
+  (negative counts from the end); `--guide-audio PATH[@FRAME]` anchors a soundtrack, cropped to the video's remaining
+  time. Guides are never shown to the text encoder, only injected as condition latents. `--audio-guide` is an alias.
+- **Denoise masks** (`SetLatentNoiseMask`): `--source` + `--mask`. The mask is resampled to the latent grid with ComfyUI's
+  trilinear `reshape_mask`, pooled to the DiT's 2×2 token grid, and kept cells are injected into every model input and
+  restored in every prediction, with their own timestep and velocity scaled by the mask, as in
+  `MiniMaxH3.scale_latent_inpaint`. Audio can follow the mask in time (`--mask-audio follow`, the default), be kept
+  or be regenerated. Works with `--upscale`.
+- **Fun ControlNet** (`MiniMaxH3FunControlNetApply`): `--controlnet NAME` (in `models/model_patches`) with
+  `--control-video`, and/or the source and mask as an inpainting hint, `--control-strength`, `--control-start`,
+  `--control-end`. The control blocks load next to the DiT and stay attached while requests use the same checkpoint.
+
 ## Not yet ported
 
-`MiniMaxH3AddGuide` clips/audio at arbitrary frames, Fun ControlNet, denoise masks. The older
-`MiniMax-H3-FL2VA-Acc-8Step_comfy` LoRA targets adaLN at a width the pruned "curve" checkpoint doesn't have; those
+The older`MiniMax-H3-FL2VA-Acc-8Step_comfy` LoRA targets adaLN at a width the pruned "curve" checkpoint doesn't have; those
 targets are skipped (as in ComfyUI). Prefer the official turbo LoRAs, which only touch attention/MLP.

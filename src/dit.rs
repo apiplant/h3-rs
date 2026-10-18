@@ -312,16 +312,28 @@ impl DitConfig {
     }
 }
 
-struct Block {
-    norm1: Tensor,
-    norm2: Tensor,
-    q_norm: Tensor,
-    k_norm: Tensor,
-    qkv: QLinear,
-    out: QLinear,
-    fc1: QLinear,
-    fc2: QLinear,
-    adaln: QLinear,
+pub(crate) struct Block {
+    pub(crate) norm1: Tensor,
+    pub(crate) norm2: Tensor,
+    pub(crate) q_norm: Tensor,
+    pub(crate) k_norm: Tensor,
+    pub(crate) qkv: QLinear,
+    pub(crate) out: QLinear,
+    pub(crate) fc1: QLinear,
+    pub(crate) fc2: QLinear,
+    pub(crate) adaln: QLinear,
+}
+
+/// Per-forward state a block needs besides its weights.
+pub(crate) struct StepCtx<'a> {
+    /// Timestep embeddings of the distinct timesteps, `[U, t_dim]` f32.
+    pub t_emb: &'a Tensor,
+    /// Curve-form adaLN (no SiLU before the projection).
+    pub curve: bool,
+    /// Per-token row of the `[3U, hidden]` modulation tables.
+    pub idx: &'a Tensor,
+    pub rope: &'a Tensor,
+    pub u: usize,
 }
 
 struct RefinerBlock {
@@ -362,6 +374,7 @@ pub struct Dit {
     audio_out: QLinear,
     /// PDD head bank size of the output heads (1 = plain heads).
     pdd_heads: usize,
+    control: Option<crate::control::Control>,
     /// Debug: block indices whose outputs are recorded into `captured`.
     pub capture_blocks: Vec<usize>,
     pub captured: std::cell::RefCell<Vec<(usize, Tensor)>>,
@@ -379,6 +392,33 @@ pub struct DitCond {
     pub seed: u64,
     pub visual_cond_noise_aug: f64,
     pub audio_cond_noise_aug: f64,
+    /// Denoise mask on the 2x2-patch token grid (see [`TokenMasks`]).
+    pub denoise: Option<TokenMasks>,
+    /// Fun ControlNet hint and schedule (needs [`Dit::set_control`]).
+    pub control: Option<ControlCond>,
+}
+
+/// A denoise mask (1 = generate, 0 = keep) pooled to the DiT's token grid, as ComfyUI's
+/// `MiniMaxH3._token_grid_masks`: video max-pooled per 2x2 latent patch, every value rounded up to a multiple of
+/// 1/256. A stream is `None` when it generates everywhere. Rows with a mask value below 1 run at their own
+/// timestep and their velocity is scaled by the value.
+#[derive(Clone, Default)]
+pub struct TokenMasks {
+    /// `[T, H, W]` latent cells, row-major.
+    pub video: Option<Vec<f32>>,
+    /// One value per audio latent frame.
+    pub audio: Option<Vec<f32>>,
+}
+
+/// A Fun ControlNet hint for one sampling pass.
+#[derive(Clone)]
+pub struct ControlCond {
+    /// Hint latent `[1, C, T, H, W]` (24 channels, or 49 with the inpaint visibility mask and masked source).
+    pub latent: Tensor,
+    pub strength: f64,
+    /// The ControlNet runs while `sigma_end <= sigma <= sigma_start`.
+    pub sigma_start: f64,
+    pub sigma_end: f64,
 }
 
 #[derive(Clone)]
@@ -411,7 +451,22 @@ pub struct DitRun {
     lat_h: usize,
     lat_w: usize,
     audio_t: usize,
+    /// Per-2x2-patch-row mask values of the video stream, and per-audio-row (`2 * audio_t`, channel-major), for
+    /// the per-row timesteps; `*_out` scale the predicted velocity (`[1, 1, T, H, W]`, `[1, 1, 2, audio_t]`).
+    vmask_rows: Option<Vec<f32>>,
+    vmask_out: Option<Tensor>,
+    amask_rows: Option<Vec<f32>>,
+    amask_out: Option<Tensor>,
+    control: Option<RunControl>,
     pub sample_sigmas: Vec<f64>,
+}
+
+pub(crate) struct RunControl {
+    pub(crate) cond: ControlCond,
+    /// Control patch rows for every video-kind row of the packed sequence (zeros for keyframe / reference rows).
+    pub(crate) rows: Tensor,
+    /// `[S, 1]`: the strength for rows the control adds to, 0 for audio rows.
+    pub(crate) scale: Tensor,
 }
 
 fn ld(f: &Arc<SafeFile>, name: &str, dev: &Device, dt: DType) -> Result<Tensor> {
@@ -515,6 +570,7 @@ impl Dit {
             video_out: dense_f32(&f, "final_layer.video_out", dev)?,
             audio_out: dense_f32(&f, "final_layer.audio_out", dev)?,
             pdd_heads: 1,
+            control: None,
             capture_blocks: vec![],
             captured: Default::default(),
             cfg,
@@ -803,6 +859,12 @@ impl Dit {
         }
         let layout = PackedLayout::new(text_len, lt, lh, lw, audio_t, &kf_specs, &ref_specs);
         let rope = self.rope_angles(&layout)?;
+        let (vmask_rows, vmask_out, amask_rows, amask_out) = self.mask_rows(cond.denoise.as_ref(), lt, lh, lw, audio_t)?;
+        let control = match (&cond.control, &self.control) {
+            (Some(c), Some(model)) => Some(model.prepare_run(c, &layout)?),
+            (Some(_), None) => bail!("a control hint needs a loaded ControlNet (Dit::set_control)"),
+            _ => None,
+        };
         if let Some(t) = &cond.tags {
             if t.len() != text_len {
                 bail!("token tags ({}) do not match text length ({text_len})", t.len());
@@ -821,8 +883,124 @@ impl Dit {
             lat_w: lw,
             audio_t,
             layout,
+            vmask_rows,
+            vmask_out,
+            amask_rows,
+            amask_out,
+            control,
             sample_sigmas,
         })
+    }
+
+    /// Attach (or drop) a Fun ControlNet; requests with a [`ControlCond`] then run it.
+    pub fn set_control(&mut self, control: Option<crate::control::Control>) -> Result<()> {
+        if let Some(c) = &control {
+            c.check_base(self.cfg.time_embed_dim, self.cfg.curve_grid.is_some())?;
+        }
+        self.control = control;
+        Ok(())
+    }
+
+    pub fn has_control(&self) -> bool {
+        self.control.is_some()
+    }
+
+    /// Checkpoint of the attached ControlNet.
+    pub fn control_path(&self) -> Option<&str> {
+        self.control.as_ref().map(|c| c.path.as_str())
+    }
+
+    /// Whether the weights are all resident (the ControlNet then loads resident too).
+    pub fn fully_resident(&self) -> bool {
+        self.resident == self.cfg.layers
+    }
+
+    /// Row-level views of a [`TokenMasks`]: per-row values for the timesteps, and the velocity scale tensors.
+    #[allow(clippy::type_complexity)]
+    fn mask_rows(&self, m: Option<&TokenMasks>, lt: usize, lh: usize, lw: usize, audio_t: usize) -> Result<(Option<Vec<f32>>, Option<Tensor>, Option<Vec<f32>>, Option<Tensor>)> {
+        let Some(m) = m else { return Ok((None, None, None, None)) };
+        let (mut vrows, mut vout) = (None, None);
+        if let Some(v) = &m.video {
+            if v.len() != lt * lh * lw {
+                bail!("video mask has {} cells, the latent {}", v.len(), lt * lh * lw);
+            }
+            let mut rows = Vec::with_capacity(lt * (lh / 2) * (lw / 2));
+            for t in 0..lt {
+                for y in 0..lh / 2 {
+                    for x in 0..lw / 2 {
+                        let at = |dy: usize, dx: usize| v[(t * lh + 2 * y + dy) * lw + 2 * x + dx];
+                        rows.push(at(0, 0).max(at(0, 1)).max(at(1, 0)).max(at(1, 1)));
+                    }
+                }
+            }
+            vrows = Some(rows);
+            vout = Some(Tensor::from_vec(v.clone(), (1, 1, lt, lh, lw), &self.dev)?);
+        }
+        let (mut arows, mut aout) = (None, None);
+        if let Some(a) = &m.audio {
+            if a.len() != audio_t {
+                bail!("audio mask has {} frames, the latent {audio_t}", a.len());
+            }
+            arows = Some([a.as_slice(), a.as_slice()].concat());
+            aout = Some(Tensor::from_vec([a.as_slice(), a.as_slice()].concat(), (1, 1, 2, audio_t), &self.dev)?);
+        }
+        Ok((vrows, vout, arows, aout))
+    }
+
+    /// One transformer block over the packed stream `x` (shared by the base blocks and the ControlNet's), given its
+    /// weights already fetched as `[qkv, out, fc1, fc2]`.
+    pub(crate) fn run_block(&self, b: &Block, raws: [crate::weights::Raw; 4], mut x: Tensor, cx: &StepCtx) -> Result<Tensor> {
+        let dev = &self.dev;
+        let [r_qkv, r_out, r_fc1, r_fc2] = raws;
+        let (h, d, hidden) = (self.cfg.heads, self.cfg.head_dim, self.cfg.hidden);
+        let rot = cx.rope.dim(2)? * 2;
+        let chunk = self.mem.token_chunk;
+        let te = if cx.curve { cx.t_emb.clone() } else { ops::silu(cx.t_emb)?.to_dtype(self.dtype)? };
+        let m = b.adaln.forward(&te)?.to_dtype(DType::F32)?; // [U, 6*hidden*3]
+        let m = m.reshape((cx.u * 3, 6 * hidden))?;
+        let c = |i: usize| m.narrow(1, i * hidden, hidden).and_then(|t| t.contiguous());
+        let (shift_msa, scale_msa, gate_msa) = (c(0)?, c(1)?, c(2)?);
+        let (shift_mlp, scale_mlp, gate_mlp) = (c(3)?, c(4)?, c(5)?);
+
+        let n1 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, cx.idx)?) })?;
+        let groups = self.attn_groups(n1.dim(0)?, &b.qkv);
+        let att = if groups > 1 {
+            self.attend_grouped(b, n1, &r_qkv, cx.rope, rot, groups, chunk)?
+        } else {
+            let qkv = prof::time("qkv linear", dev, || b.qkv.forward_raw(&n1, &r_qkv, chunk))?;
+            drop(n1);
+            let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(cx.rope), rot, h, d))?;
+            drop(qkv);
+            att
+        };
+        let o = prof::time("out linear", dev, || b.out.forward_raw(&att, &r_out, chunk))?;
+        drop(att);
+        x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, cx.idx))?;
+        drop(o);
+
+        let n2 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, cx.idx)?) })?;
+        let w1 = prof::time("dequant", dev, || b.fc1.prepare(r_fc1.clone(), dev, self.dtype))?;
+        let w2 = prof::time("dequant", dev, || b.fc2.prepare(r_fc2.clone(), dev, self.dtype))?;
+        drop((r_qkv, r_out, r_fc1, r_fc2));
+        let s = n2.dim(0)?;
+        let mut outs = vec![];
+        let mc = self.mem.mlp_chunk.max(1);
+        let mut st = 0;
+        prof::time("mlp", dev, || -> Result<()> {
+            while st < s {
+                let n = mc.min(s - st);
+                let hc = b.fc1.run_swiglu(&n2.narrow(0, st, n)?, &w1, usize::MAX)?;
+                outs.push(b.fc2.run(&hc, &w2, usize::MAX)?);
+                st += n;
+            }
+            Ok(())
+        })?;
+        drop((w1, w2, n2));
+        let mo = Tensor::cat(&outs, 0)?;
+        drop(outs);
+        x = kernels::gate_add(&x, &mo, &gate_mlp, cx.idx)?;
+
+        Ok(x)
     }
 
     fn time_embed(&self, t_vals: &[f64]) -> Result<Tensor> {
@@ -884,17 +1062,34 @@ impl Dit {
                 Seg::CondAudio | Seg::RefAudio => t_a.max(run.aud_aug),
             }
         };
+        // masked rows run at their own strength: a row with mask value m sits at sigma = m * sigma_stream, so its
+        // label is 1 - m * sigma, held at the cond timestep for rows that are kept
+        let (t_pin_v, t_pin_a) = (t_v.max(VISUAL_COND_TIMESTEP), t_a.max(AUDIO_COND_TIMESTEP));
+        let v_rows_t: Option<Vec<f64>> = run.vmask_rows.as_ref().map(|m| m.iter().map(|&v| (1.0 - v as f64 * sigma_v).min(t_pin_v)).collect());
+        let a_rows_t: Option<Vec<f64>> = run.amask_rows.as_ref().map(|m| m.iter().map(|&v| (1.0 - v as f64 * sigma_a).min(t_pin_a)).collect());
         let mut unique: Vec<f64> = vec![t_v, t_a];
         for s in &layout.segments {
             unique.push(seg_t(s.2));
         }
+        unique.extend(v_rows_t.iter().chain(a_rows_t.iter()).flatten());
         unique.sort_by(|a, b| a.partial_cmp(b).unwrap());
         unique.dedup();
-        let t_row = |t: f64| unique.iter().position(|u| *u == t).unwrap() as u32;
+        let t_row = |t: f64| unique.binary_search_by(|u| u.partial_cmp(&t).unwrap()).unwrap() as u32;
 
         // per-token mod-row index into the [3U, hidden] block tables
         let mut idx = vec![0u32; layout.seq_len];
         for &(a, b, k) in &layout.segments {
+            let rows_t = match k {
+                Seg::Video => v_rows_t.as_deref(),
+                Seg::Audio => a_rows_t.as_deref(),
+                _ => None,
+            };
+            if let Some(rt) = rows_t {
+                for (slot, &t) in idx[a..b].iter_mut().zip(rt) {
+                    *slot = t_row(t) * 3 + k.tag();
+                }
+                continue;
+            }
             let base = t_row(seg_t(k)) * 3;
             for (i, slot) in idx[a..b].iter_mut().enumerate() {
                 *slot = if k == Seg::Text { base + run.tags.as_ref().map(|t| t[i]).unwrap_or(1) } else { base + k.tag() };
@@ -933,62 +1128,32 @@ impl Dit {
         }
         let mut x = Tensor::cat(&parts, 0)?;
         drop((parts, ve, ae, all_v, all_a));
+        // the ControlNet branches off the stream as it enters the first block
+        let ctrl = match (&self.control, &run.control) {
+            (Some(model), Some(rc)) if rc.cond.sigma_end <= sigma_v && sigma_v <= rc.cond.sigma_start => Some((model, rc)),
+            _ => None,
+        };
+        let pristine = ctrl.map(|_| x.clone());
+        let mut cstream: Option<Tensor> = None;
 
         let t_emb = self.time_embed(&unique)?; // [U, t_dim] f32
         let curve = self.adaln_t_table.is_some();
-        let (h, d, hidden) = (self.cfg.heads, self.cfg.head_dim, self.cfg.hidden);
-        let rot = run.rope.dim(2)? * 2;
-        let u = unique.len();
-        let chunk = self.mem.token_chunk;
+        let hidden = self.cfg.hidden;
+        let cx = StepCtx { t_emb: &t_emb, curve, idx: &idx, rope: &run.rope, u: unique.len() };
         let fetch = |b: &Block| -> Result<[crate::weights::Raw; 4]> { Ok([b.qkv.fetch(dev)?, b.out.fetch(dev)?, b.fc1.fetch(dev)?, b.fc2.fetch(dev)?]) };
         let mut next = Some(fetch(&self.blocks[0])?);
         let mut prev_marker: Option<crate::weights::Marker> = None;
         for (bi, b) in self.blocks.iter().enumerate() {
             let [r_qkv, r_out, r_fc1, r_fc2] = next.take().unwrap();
-            let te = if curve { t_emb.clone() } else { ops::silu(&t_emb)?.to_dtype(self.dtype)? };
-            let m = b.adaln.forward(&te)?.to_dtype(DType::F32)?; // [U, 6*hidden*3]
-            let m = m.reshape((u * 3, 6 * hidden))?;
-            let c = |i: usize| m.narrow(1, i * hidden, hidden).and_then(|t| t.contiguous());
-            let (shift_msa, scale_msa, gate_msa) = (c(0)?, c(1)?, c(2)?);
-            let (shift_mlp, scale_mlp, gate_mlp) = (c(3)?, c(4)?, c(5)?);
-
-            let n1 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, &idx)?) })?;
-            let groups = self.attn_groups(n1.dim(0)?, &b.qkv);
-            let att = if groups > 1 {
-                self.attend_grouped(b, n1, &r_qkv, &run.rope, rot, groups, chunk)?
-            } else {
-                let qkv = prof::time("qkv linear", dev, || b.qkv.forward_raw(&n1, &r_qkv, chunk))?;
-                drop(n1);
-                let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(&run.rope), rot, h, d))?;
-                drop(qkv);
-                att
-            };
-            let o = prof::time("out linear", dev, || b.out.forward_raw(&att, &r_out, chunk))?;
-            drop(att);
-            x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, &idx))?;
-            drop(o);
-
-            let n2 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm2, self.cfg.eps, &scale_mlp, &shift_mlp, &idx)?) })?;
-            let w1 = prof::time("dequant", dev, || b.fc1.prepare(r_fc1.clone(), dev, self.dtype))?;
-            let w2 = prof::time("dequant", dev, || b.fc2.prepare(r_fc2.clone(), dev, self.dtype))?;
-            drop((r_qkv, r_out, r_fc1, r_fc2));
-            let s = n2.dim(0)?;
-            let mut outs = vec![];
-            let mc = self.mem.mlp_chunk.max(1);
-            let mut st = 0;
-            prof::time("mlp", dev, || -> Result<()> {
-                while st < s {
-                    let n = mc.min(s - st);
-                    let hc = b.fc1.run_swiglu(&n2.narrow(0, st, n)?, &w1, usize::MAX)?;
-                    outs.push(b.fc2.run(&hc, &w2, usize::MAX)?);
-                    st += n;
+            x = self.run_block(b, [r_qkv, r_out, r_fc1, r_fc2], x, &cx)?;
+            if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {
+                if ci == 0 {
+                    cstream = Some(model.init_stream(pristine.as_ref().unwrap(), &rc.rows, layout)?);
                 }
-                Ok(())
-            })?;
-            drop((w1, w2, n2));
-            let mo = Tensor::cat(&outs, 0)?;
-            drop(outs);
-            x = kernels::gate_add(&x, &mo, &gate_mlp, &idx)?;
+                let (c, skip) = model.step(self, ci, cstream.take().unwrap(), &cx)?;
+                cstream = Some(c);
+                x = (x + skip.to_dtype(self.dtype)?.broadcast_mul(&rc.scale.to_dtype(self.dtype)?)?)?;
+            }
             // block bi is enqueued: once the GPU is past block bi-1, start uploading block bi+1
             if let Some(m) = prev_marker.take() {
                 m.wait();
@@ -1014,8 +1179,21 @@ impl Dit {
         };
         let (va, vb) = layout.find(Seg::Video);
         let (aa, ab) = layout.find(Seg::Audio);
-        let hv = head_in(va, vb, t_row(t_v))?;
-        let ha = head_in(aa, ab, t_row(t_a))?;
+        let head_in_rows = |a: usize, b: usize, rows_t: &[f64]| -> Result<Tensor> {
+            let n = ops::rms_norm(&x.narrow(0, a, b - a)?, Some(&self.final_norm), self.cfg.eps)?.to_dtype(DType::F32)?;
+            let rows = Tensor::from_vec(rows_t.iter().map(|&t| t_row(t)).collect::<Vec<u32>>(), rows_t.len(), dev)?;
+            let sc = fscale.contiguous()?.index_select(&rows, 0)?;
+            let sh = shift.contiguous()?.index_select(&rows, 0)?;
+            Ok((((sc + 1.0)? * n)? + sh)?)
+        };
+        let hv = match &v_rows_t {
+            Some(r) => head_in_rows(va, vb, r)?,
+            None => head_in(va, vb, t_row(t_v))?,
+        };
+        let ha = match &a_rows_t {
+            Some(r) => head_in_rows(aa, ab, r)?,
+            None => head_in(aa, ab, t_row(t_a))?,
+        };
         let (v, a) = if self.pdd_heads == 1 {
             (self.video_out.forward(&hv)?, self.audio_out.forward(&ha)?)
         } else {
@@ -1039,6 +1217,15 @@ impl Dit {
         let video = unpatchify_video(&v, run.latent_t, run.lat_h / 2, run.lat_w / 2, self.cfg.latents_dim)?;
         let video = video.narrow(2, 0, ot)?.narrow(3, 0, oh)?.narrow(4, 0, ow)?;
         let audio = unpack_audio(&a)?;
+        // rows that are partly kept predict at mask * sigma: scale their velocity to match
+        let video = match &run.vmask_out {
+            Some(m) => video.broadcast_mul(m)?,
+            None => video,
+        };
+        let audio = match &run.amask_out {
+            Some(m) => audio.broadcast_mul(m)?,
+            None => audio,
+        };
         let _ = run.audio_t;
         Ok((video.neg()?, audio.neg()?))
     }

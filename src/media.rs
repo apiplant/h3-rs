@@ -190,3 +190,63 @@ pub fn load_audio(path: &str, sample_rate: u32, max_seconds: Option<f64>) -> Res
     let t = Tensor::from_vec(s[..n * 2].to_vec(), (n, 2), &Device::Cpu)?;
     Ok(t.t()?.contiguous()?)
 }
+
+/// An image file as one frame, or a video decoded at `fps` to at most `max_frames`: `[T, H, W, 3]` in [0, 1] (CPU).
+pub fn load_frames(path: &str, fps: f64, max_frames: usize) -> Result<Tensor> {
+    let is_image = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map(|r| r.format().is_some()).unwrap_or(false);
+    if is_image {
+        Ok(load_image(path)?.unsqueeze(0)?)
+    } else {
+        load_video(path, fps, max_frames)
+    }
+}
+
+/// A mask image or video as luminance `[T, H, W]` (white = 1), at most `max_frames` frames (CPU).
+pub fn load_mask(path: &str, fps: f64, max_frames: usize) -> Result<Tensor> {
+    let rgb = load_frames(path, fps, max_frames)?;
+    let w = Tensor::new(&[0.299f32, 0.587, 0.114], rgb.device())?.reshape((1, 1, 1, 3))?;
+    Ok(rgb.broadcast_mul(&w)?.sum(3)?)
+}
+
+/// Center-crop `[N, C, H, W]` to the target aspect, then bilinear resize (ComfyUI `common_upscale(..., "bilinear",
+/// "center")`).
+pub fn resize_bilinear_crop(x: &Tensor, width: usize, height: usize) -> Result<Tensor> {
+    let (_, _, h, w) = x.dims4()?;
+    let (old, new) = (w as f64 / h as f64, width as f64 / height as f64);
+    let (mut x0, mut y0, mut cw, mut ch) = (0, 0, w, h);
+    if old > new {
+        x0 = ((w as f64 - w as f64 * (new / old)) / 2.0).round() as usize;
+        cw = w - 2 * x0;
+    } else if old < new {
+        y0 = ((h as f64 - h as f64 * (old / new)) / 2.0).round() as usize;
+        ch = h - 2 * y0;
+    }
+    resize_bilinear(&x.narrow(2, y0, ch)?.narrow(3, x0, cw)?.contiguous()?, height, width)
+}
+
+/// Trilinear resize (`align_corners=False`, like `torch.nn.functional.interpolate`) of a `[T, H, W]` volume.
+pub fn resize_trilinear(src: &[f32], from: (usize, usize, usize), to: (usize, usize, usize)) -> Vec<f32> {
+    let axis = |n_in: usize, n_out: usize| -> Vec<(usize, usize, f32)> {
+        let scale = n_in as f32 / n_out as f32;
+        (0..n_out)
+            .map(|o| {
+                let f = ((o as f32 + 0.5) * scale - 0.5).max(0.0);
+                let i0 = (f as usize).min(n_in - 1);
+                (i0, (i0 + 1).min(n_in - 1), f - i0 as f32)
+            })
+            .collect()
+    };
+    let (at, ah, aw) = (axis(from.0, to.0), axis(from.1, to.1), axis(from.2, to.2));
+    let at_ = |t: usize, y: usize, x: usize| src[(t * from.1 + y) * from.2 + x];
+    let mut out = Vec::with_capacity(to.0 * to.1 * to.2);
+    for &(t0, t1, dt) in &at {
+        for &(y0, y1, dy) in &ah {
+            for &(x0, x1, dx) in &aw {
+                let lerp = |a: f32, b: f32, f: f32| a + (b - a) * f;
+                let row = |t: usize| lerp(lerp(at_(t, y0, x0), at_(t, y0, x1), dx), lerp(at_(t, y1, x0), at_(t, y1, x1), dx), dy);
+                out.push(lerp(row(t0), row(t1), dt));
+            }
+        }
+    }
+    out
+}

@@ -14,7 +14,7 @@ use crate::kernels;
 use crate::ops;
 use crate::weights::{Placement, QLinear, SafeFile};
 
-const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+pub const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 const RATIO: usize = 16;
 const RATIO_T: usize = 4;

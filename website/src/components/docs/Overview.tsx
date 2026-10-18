@@ -61,9 +61,8 @@ export function DocsOverview() {
       <Section>
         <H2>Not yet ported</H2>
         <P>
-          <IC>MiniMaxH3AddGuide</IC> clips and audio at arbitrary frames, Fun ControlNet and denoise masks. The older{" "}
-          <IC>MiniMax-H3-FL2VA-Acc-8Step_comfy</IC> LoRA targets adaLN at a width the pruned checkpoint doesn't have, so those
-          targets are skipped (as in ComfyUI); prefer the official turbo LoRAs.
+          The older <IC>MiniMax-H3-FL2VA-Acc-8Step_comfy</IC> LoRA targets adaLN at a width the pruned checkpoint doesn't have, so
+          those targets are skipped (as in ComfyUI); prefer the official turbo LoRAs.
         </P>
       </Section>
     </DocsLayout>
