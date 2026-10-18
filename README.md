@@ -16,12 +16,39 @@ Quantized weights stay quantized in memory and are dequantized per layer by NVRT
 
 ## Install
 
-Packages for Arch, Debian/Ubuntu and Homebrew on Linux x86_64, release archives and the website live at
-[h3-rs.apiplant.com](https://h3-rs.apiplant.com); see [`packaging/`](packaging/README.md). Or from source:
+Linux x86_64 only (the engine is CUDA): an NVIDIA GPU (Ampere or newer), a driver for CUDA 13, `ffmpeg`, and the ComfyUI MiniMax H3 model files. Release archives and the website live at [h3-rs.apiplant.com](https://h3-rs.apiplant.com); see [`packaging/`](packaging/README.md).
+
+Homebrew:
 
 ```sh
-cargo install h3-rs            # needs the CUDA 13 toolkit (nvcc) and ffmpeg at run time
+brew tap apiplant/tap
+brew install apiplant/tap/h3-rs
 ```
+
+Arch Linux, via the signed pacman repository (one-time setup, then `pacman -Syu` picks up new releases):
+
+```sh
+curl -sSfL https://apiplant.github.io/pacman/apiplant.gpg -o /tmp/apiplant.gpg
+keyid=$(gpg --show-keys --with-colons /tmp/apiplant.gpg | awk -F: '/^pub:/ { print $5; exit }') && sudo pacman-key --add /tmp/apiplant.gpg && sudo pacman-key --finger "$keyid" && sudo pacman-key --lsign-key "$keyid"
+printf '\n[apiplant]\nSigLevel = Required DatabaseOptional\nServer = https://apiplant.github.io/pacman/$arch\n' | sudo tee -a /etc/pacman.conf > /dev/null
+sudo pacman -Sy h3-rs
+```
+
+Debian/Ubuntu, via the signed apt repository at `apt.apiplant.com` (one-time setup, then `apt upgrade` picks up new releases):
+
+```sh
+curl -sSfL https://apt.apiplant.com/apiplant-archive-keyring.gpg | sudo tee /usr/share/keyrings/apiplant.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/apiplant.gpg] https://apt.apiplant.com stable main" | sudo tee /etc/apt/sources.list.d/apiplant.list > /dev/null
+sudo apt update && sudo apt install h3-rs
+```
+
+From crates.io (needs the CUDA 13 toolkit with `nvcc`):
+
+```sh
+cargo install h3-rs --features serve
+```
+
+Then put the ComfyUI MiniMax H3 files in a `models/` folder and run `H3_MODELS_DIR=~/ComfyUI/models h3 serve`.
 
 ## Build
 
