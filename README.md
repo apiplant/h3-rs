@@ -63,24 +63,24 @@ cargo build --release                   # first build compiles flash-attn (~15 m
 
 ```sh
 # text -> video+audio (defaults: 1344x768, 124 frames ≈ 5.2 s, 20 steps, res_multistep)
-./target/release/h3 generate -p "A red fox trots through fresh snow at dawn, crunching footsteps." -o fox.mp4
+h3 generate -p "A red fox trots through fresh snow at dawn, crunching footsteps." -o fox.mp4
 
 # first (and/or last) keyframe: the canvas follows the image's aspect ratio at --megapixels (default 1.0,
 # like ComfyUI's ImageScaleToTotalPixels); --width/--height/--aspect 9:16 override, --fit stretch|crop
-./target/release/h3 generate -p "..." --image first.png --last-image last.png
+h3 generate -p "..." --image first.png --last-image last.png
 
 # reference to video (ref2va checkpoint is picked automatically). Tags are numbered per type in this order:
 # images, then videos (a video's soundtrack is the <Audio j> just before its <Video k>), then --ref-audio files.
-./target/release/h3 generate -p "<Picture 1> walks through the scene of <Video 1>, speaking with the voice of <Audio 2>" \
+h3 generate -p "<Picture 1> walks through the scene of <Video 1>, speaking with the voice of <Audio 2>" \
     --ref-image person.png --ref-video scene.mp4 --ref-audio voice.wav        # --ref-video-mute, --ref-image-size max
 
 # official turbo LoRAs (Comfy-Org/MiniMax-H3 loras/): 8 steps fl2v, 4 steps ref2v
-./target/release/h3 generate -p "..." --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
-./target/release/h3 generate -p "..." --ref-image a.png --lora minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors --steps 4
+h3 generate -p "..." --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
+h3 generate -p "..." --ref-image a.png --lora minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors --steps 4
 
 # re-decode saved latents
-./target/release/h3 generate -p "..." --save-latents run.safetensors
-./target/release/h3 decode run.safetensors -o run.mp4
+h3 generate -p "..." --save-latents run.safetensors
+h3 decode run.safetensors -o run.mp4
 ```
 
 Models resolve under `--models-dir` (env `H3_MODELS_DIR`; default `./models` or `~/ComfyUI/models` if present, else `~/.cache/h3-rs/models`). Override
@@ -97,7 +97,7 @@ latent as in ComfyUI.
 rest of the GPU) and renders requests one at a time:
 
 ```sh
-./target/release/h3 serve --addr 127.0.0.1:8188 --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
+h3 serve --addr 127.0.0.1:8188 --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
 curl -o out.mp4 -H 'content-type: application/json' localhost:8188/v1/generate \
   -d '{"prompt": "A red fox trots through snow", "seconds": 5, "seed": 3}'
 ```
