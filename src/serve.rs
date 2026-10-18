@@ -8,7 +8,7 @@
 //!   "length", "steps", "seed", "sampler": "res_multistep"|"euler", "shift_video", "shift_audio",
 //!   "image": b64, "last_image": b64, "fit": "stretch"|"crop", "ref_images": [b64], "ref_videos": [b64],
 //!   "ref_video_mute", "ref_audios": [b64], "ref_image_size": "match"|"max", "lora": name,
-//!   "lora_strength", "crf"}` (only `prompt` is required; media fields are base64 file contents, a
+//!   "lora_strength", "upscale", "upscale_split", "crf"}` (only `prompt` is required; media fields are base64 file contents, a
 //!   `data:` URL prefix is accepted). Returns `video/mp4`. A plain-text body is taken as the prompt.
 //! - `GET /v1/info`: models, memory settings, available LoRAs, queue length. `GET /v1/status`: what the engine is
 //!   doing right now (stage and step), for progress bars. `GET /health`: `ok`.
@@ -27,7 +27,7 @@ use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-use crate::pipeline::{Engine, Fit, RefImageSize, RefInput, Request};
+use crate::pipeline::{Engine, Fit, RefImageSize, RefInput, Request, Upscale};
 use crate::sampling::Sampler;
 
 /// Request defaults (from the `serve` command line).
@@ -68,6 +68,10 @@ struct GenRequest {
     /// LoRA file name in models/loras ("" or "none" disables the server default)
     lora: Option<String>,
     lora_strength: Option<f64>,
+    /// Sample at 1/N of the size, upscale the latent, refine at full size (0 or 1: off)
+    upscale: Option<f64>,
+    /// With `upscale`: fraction of the steps sampled at the low resolution (default 0.5)
+    upscale_split: Option<f64>,
     crf: Option<u32>,
 }
 
@@ -188,6 +192,7 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
         last_frame,
         lora,
         audio_guide: None,
+        upscale: g.upscale.filter(|s| *s != 0.0 && *s != 1.0).map(|scale| Upscale { scale, split: g.upscale_split.unwrap_or(0.5) }),
         output: dir.join("out.mp4").display().to_string(),
         save_latents: None,
         crf: g.crf.unwrap_or(18),

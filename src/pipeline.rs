@@ -15,10 +15,25 @@ use crate::media;
 use crate::progress::{self, Stage};
 use crate::sampling::{self, Sampler};
 use crate::text::{RefItem, TextEncoder, Tokenizer};
+use crate::upscaler::{self, LatentUpscaler};
 use crate::vae_audio::{AudioEncoder, AudioVae};
 use crate::vae_video::VideoVae;
 
 pub const FPS: usize = 24;
+/// DiT activation memory of a forward over `tokens` (hidden 5376): ~135 KB per token with the fused qkv, ~110 KB per
+/// token once attention runs in head groups (long sequences, see `Dit::attn_groups`; measured on a 24 GB card with
+/// 153k tokens: 13 resident blocks ran out of memory, 9 fit), plus the streamed weights' buffers. Used to size the
+/// VRAM an upscaled request's second pass needs; too low is caught by the out-of-memory retry.
+fn dit_activation_bytes(tokens: usize) -> usize {
+    if 3 * tokens * 5376 * 2 <= 1_500_000_000 {
+        tokens * 135_000 + (3 << 29)
+    } else {
+        tokens * 110_000 + (2 << 30)
+    }
+}
+/// Upscaler activation memory per output latent voxel of a 32-frame segment (512 channels, f16, ~8 live tensors).
+const UPSCALER_BYTES_PER_VOXEL: usize = 8_500;
+const CHUNK_FRAMES: usize = 42;
 pub const AUDIO_LATENT_FPS: usize = 40;
 
 /// Model files, ComfyUI layout (`models/{diffusion_models,text_encoders,vae,loras}`).
@@ -28,7 +43,12 @@ pub struct ModelPaths {
     pub text_encoder: PathBuf,
     pub video_vae: PathBuf,
     pub audio_vae: PathBuf,
+    /// Latent upscaler checkpoint (`models/latent_upscale_models/`), when one was found.
+    pub upscaler: Option<PathBuf>,
 }
+
+/// Latent upscaler looked up by default.
+pub const DEFAULT_UPSCALER: &str = "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors";
 
 impl ModelPaths {
     /// Resolve each name against `<models_dir>/<subdir>/` unless it is already a path to a file.
@@ -44,7 +64,42 @@ impl ModelPaths {
             }
             bail!("model file {n} not found (looked in {})", models_dir.join(sub).display())
         };
-        Ok(Self { dit: r("diffusion_models", dit)?, text_encoder: r("text_encoders", te)?, video_vae: r("vae", vvae)?, audio_vae: r("vae", avae)? })
+        Ok(Self { dit: r("diffusion_models", dit)?, text_encoder: r("text_encoders", te)?, video_vae: r("vae", vvae)?, audio_vae: r("vae", avae)?, upscaler: None })
+    }
+
+    /// Look for the latent upscaler `name` (a path, or a file in `<models_dir>/latent_upscale_models/`).
+    /// Without `required`, a missing file just leaves upscaling unavailable.
+    pub fn with_upscaler(mut self, models_dir: &Path, name: &str, required: bool) -> Result<Self> {
+        let direct = Path::new(name);
+        let in_dir = models_dir.join("latent_upscale_models").join(name);
+        self.upscaler = if direct.is_file() {
+            Some(direct.to_path_buf())
+        } else if in_dir.is_file() {
+            Some(in_dir)
+        } else if required {
+            bail!("latent upscaler {name} not found (looked in {}); see the README for where to get it", models_dir.join("latent_upscale_models").display())
+        } else {
+            None
+        };
+        Ok(self)
+    }
+}
+
+/// Two-pass generation through the latent upscaler (the ComfyUI "Minimax H3 Latent Upscaler" workflow):
+/// the first `split` of the sampling steps run at the requested canvas, the clean estimate is upscaled
+/// `scale` times in latent space (no VAE round trip), re-noised to where the schedule stands, and the remaining
+/// steps refine it at the larger canvas, which is what gets delivered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Upscale {
+    /// Factor between the requested canvas (sampled first) and the delivered one, in (1, 4].
+    pub scale: f64,
+    /// Fraction of the steps sampled at the low resolution, in (0, 1).
+    pub split: f64,
+}
+
+impl Default for Upscale {
+    fn default() -> Self {
+        Self { scale: 1.5, split: 0.5 }
     }
 }
 
@@ -77,6 +132,8 @@ pub struct Request {
     /// Audio anchored at frame 0 (ComfyUI `MiniMaxH3AddGuide` with audio): the generated video and its
     /// soundtrack follow it, e.g. speech for a talking avatar. Cropped to the video's duration.
     pub audio_guide: Option<String>,
+    /// Sample at the requested size, upscale the latent, refine at `scale` times that size (see [`Upscale`]).
+    pub upscale: Option<Upscale>,
     pub output: String,
     pub save_latents: Option<String>,
     pub crf: u32,
@@ -151,6 +208,7 @@ impl Default for Request {
             last_frame: None,
             lora: None,
             audio_guide: None,
+            upscale: None,
             output: "h3_output.mp4".into(),
             save_latents: None,
             crf: 18,
@@ -229,7 +287,7 @@ impl Engine {
         Ok(self.te.as_ref().unwrap())
     }
 
-    fn video_vae(&mut self) -> Result<&VideoVae> {
+    pub fn video_vae(&mut self) -> Result<&VideoVae> {
         if self.vvae.is_none() {
             self.vvae = Some(VideoVae::load(&self.paths.video_vae.display().to_string(), &self.dev, &self.mem)?);
         }
@@ -314,10 +372,28 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     if w == 0 || h == 0 {
         bail!("width/height must be at least 32");
     }
+    // `(w, h)` is the requested canvas, sampled first; with an upscale `(fw, fh)` is the larger one delivered
+    let (fw, fh) = match &req.upscale {
+        Some(u) => {
+            if !(u.scale > 1.0 && u.scale <= upscaler::MAX_SCALE) {
+                bail!("upscale must be above 1 and at most {}", upscaler::MAX_SCALE);
+            }
+            if !(u.split > 0.0 && u.split < 1.0) || req.steps < 2 {
+                bail!("upscale needs at least 2 steps and a split strictly between 0 and 1");
+            }
+            let (fw, fh) = (r32(w as f64 * u.scale), r32(h as f64 * u.scale));
+            if fw <= w && fh <= h {
+                bail!("upscale {} leaves a {w}x{h} canvas unchanged", u.scale);
+            }
+            (fw, fh)
+        }
+        None => (w, h),
+    };
     let (frame_count, latent_t, audio_t) = temporal_shape(req.length);
     progress::stage(Stage::Encoding);
     log::info(&format!(
-        "{w}x{h}, {frame_count} frames ({:.2} s) -> latent {latent_t}x{}x{}, audio {audio_t}",
+        "{fw}x{fh}{}, {frame_count} frames ({:.2} s) -> latent {latent_t}x{}x{}, audio {audio_t}",
+        if req.upscale.is_some() { format!(" (sampled at {w}x{h}, then upscaled {:.2}x)", fw as f64 / w as f64) } else { String::new() },
         frame_count as f64 / FPS as f64,
         h / 16,
         w / 16
@@ -333,6 +409,17 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     if let Some(img) = &last {
         images.push(media::resize_lanczos(img, w, h, req.fit != Some(Fit::Stretch))?);
         kf_index.push(frame_count - 1);
+    }
+
+    // the same keyframes on the delivered canvas, for the refining pass
+    let mut images_final = vec![];
+    if req.upscale.is_some() {
+        if let Some(img) = &first {
+            images_final.push(media::resize_lanczos(img, fw, fh, req.fit == Some(Fit::Crop))?);
+        }
+        if let Some(img) = &last {
+            images_final.push(media::resize_lanczos(img, fw, fh, req.fit != Some(Fit::Stretch))?);
+        }
     }
 
     // references (MiniMaxH3ReferenceToVideo): images, then videos (soundtrack label first), then audio
@@ -418,11 +505,15 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
 
     // 2. keyframe / reference latents
     let mut keyframes = vec![];
+    let mut keyframes_final = vec![];
     let mut refs = vec![];
     if !images.is_empty() || !ref_imgs.is_empty() || !ref_vids.is_empty() {
         let vae = self.video_vae()?;
         for (img, idx) in images.iter().zip(&kf_index) {
             keyframes.push(KeyframeCond { frame_index: *idx, video: Some(vae.encode_image(img)?), audio: None });
+        }
+        for (img, idx) in images_final.iter().zip(&kf_index) {
+            keyframes_final.push(KeyframeCond { frame_index: *idx, video: Some(vae.encode_image(img)?), audio: None });
         }
         for img in &ref_imgs {
             refs.push(RefCond::Image { latent: vae.encode_image(img)? });
@@ -439,9 +530,14 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
         let rt = z.dim(3)?.min(audio_t);
         let z = z.narrow(3, 0, rt)?.contiguous()?;
         log::info(&format!("audio guide {path}: {:.2}s", rt as f64 / AUDIO_LATENT_FPS as f64));
-        match keyframes.iter_mut().find(|k| k.frame_index == 0) {
-            Some(kf) => kf.audio = Some(z),
-            None => keyframes.insert(0, KeyframeCond { frame_index: 0, video: None, audio: Some(z) }),
+        for (pass, kfs) in [&mut keyframes, &mut keyframes_final].into_iter().enumerate() {
+            if pass == 1 && req.upscale.is_none() {
+                continue;
+            }
+            match kfs.iter_mut().find(|k| k.frame_index == 0) {
+                Some(kf) => kf.audio = Some(z.clone()),
+                None => kfs.insert(0, KeyframeCond { frame_index: 0, video: None, audio: Some(z.clone()) }),
+            }
         }
         self.release("aenc");
     }
@@ -462,13 +558,23 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
         self.release("aenc");
     }
 
-    // 3. sample
+    // 3. sample (with an upscale: first part small, latent upscale, rest at the delivered size)
     let dit_path = if ref_mode { self.ref_dit.clone().unwrap_or(self.paths.dit.clone()) } else { self.paths.dit.clone() };
+    let upscaler_path = self.paths.upscaler.clone();
+    if req.upscale.is_some() && upscaler_path.is_none() {
+        bail!("no latent upscaler model: put {DEFAULT_UPSCALER} in models/latent_upscale_models/ (or pass --upscaler)");
+    }
+    let dev_for_upscaler = self.dev.clone();
+    let keep_models = self.keep;
     let dit = self.dit(&dit_path, req.lora.as_ref())?;
     dit.cfg.shift_video = req.shift_video;
     dit.cfg.shift_audio = req.shift_audio;
-    let dit = &*dit;
     let sigmas = sampling::simple_sigmas(req.shift_video, req.steps);
+    // steps sampled at the first size
+    let split = match &req.upscale {
+        Some(u) => ((req.steps as f64 * u.split).round() as usize).clamp(1, req.steps - 1),
+        None => req.steps,
+    };
     let cond = DitCond {
         text: enc.hidden,
         tags: Some(enc.tags),
@@ -478,8 +584,9 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
         visual_cond_noise_aug: VISUAL_COND_TIMESTEP,
         audio_cond_noise_aug: AUDIO_COND_TIMESTEP,
     };
+    let cond_final = req.upscale.map(|_| DitCond { keyframes: std::mem::take(&mut keyframes_final), ..cond.clone() });
     let vshape = [1usize, 24, latent_t, h / 16, w / 16];
-    let run = dit.prepare(&cond, &vshape, audio_t, sigmas.clone())?;
+    let run = dit.prepare(&cond, &vshape, audio_t, sigmas[..=split].to_vec())?;
     drop(cond);
     // noise for the packed latent (audio carried on the video schedule): sigma_max = 1
     // same stream as ComfyUI's RandomNoise: one torch.manual_seed(seed) generator, video then audio
@@ -491,21 +598,94 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     let t2 = Instant::now();
     let mut last = Instant::now();
     progress::count(Stage::Sampling, 0, req.steps);
-    let (zv, za) = sampling::sample(&dit, &run, xv, xa, &sigmas, req.sampler, |i, n| {
-        progress::count(Stage::Sampling, i, n);
-        log::info(&format!("step {i}/{n}  {:.3}s/it  ({})", last.elapsed().as_secs_f64(), vram()));
-        last = Instant::now();
-    })?;
+    let step_log = |done: usize, last: &mut Instant| {
+        progress::count(Stage::Sampling, done, req.steps);
+        log::info(&format!("step {done}/{}  {:.3}s/it  ({})", req.steps, last.elapsed().as_secs_f64(), vram()));
+        *last = Instant::now();
+    };
+    let first_pass = sampling::sample_denoised(&*dit, &run, xv, xa, &sigmas[..=split], req.sampler, |i, _| step_log(i, &mut last))?;
+    drop(run);
+    let (zv, za) = match (&req.upscale, cond_final, upscaler_path) {
+        (Some(_), Some(cond_final), Some(up_path)) => {
+            drop(first_pass.xv);
+            // The DiT was loaded with headroom for the first canvas. The upscaler's activations and then a pass with
+            // ~scale^2 times the tokens (activations grow with them) need more: stream some resident blocks from
+            // RAM to make room, and stream more and redo the stage if the estimate was short.
+            let cells = (fh / 16, fw / 16);
+            let tokens = latent_t * (fh / 32) * (fw / 32);
+            let upscaler_need = (CHUNK_FRAMES.min(latent_t + 10) * cells.0 * cells.1) * UPSCALER_BYTES_PER_VOXEL + (6 << 28);
+            let need = dit_activation_bytes(tokens).max(upscaler_need);
+            crate::kernels::trim_pool();
+            let free = vram_info().map(|(f, _)| f).unwrap_or(usize::MAX);
+            let base_resident = dit.resident_blocks();
+            let mut keep = base_resident;
+            if free < need {
+                keep = base_resident.saturating_sub((need - free).div_ceil(dit.block_bytes().max(1)));
+                log::info(&format!("upscaling and a {tokens}-token second pass need ~{:.1} GB: {keep}/{base_resident} DiT blocks stay resident", need as f64 / 1e9));
+                dit.set_resident(keep)?;
+                crate::kernels::trim_pool();
+            }
+            let is_oom = |e: &anyhow::Error| format!("{e:?}").contains("OUT_OF_MEMORY");
+            let mut attempt = 0;
+            // the clean estimate of the first pass, upscaled in latent space
+            let zv_up = loop {
+                attempt += 1;
+                match upscale_video_latent(&up_path, &dev_for_upscaler, &first_pass.denoised_v, cells) {
+                    Ok(z) => break z,
+                    Err(e) if keep > 0 && attempt < 6 && is_oom(&e) => {
+                        keep = keep.saturating_sub(keep.div_ceil(4).max(4));
+                        log::warn(&format!("out of memory upscaling, retrying with {keep} resident DiT blocks"));
+                        dit.set_resident(keep)?;
+                        crate::kernels::trim_pool();
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let sig = &sigmas[split..];
+            let vshape = [1usize, 24, latent_t, fh / 16, fw / 16];
+            attempt = 0;
+            let out = loop {
+                attempt += 1;
+                let r = (|| -> Result<(Tensor, Tensor)> {
+                    // re-noise to where the schedule stands (CONST: x = sigma * noise + (1 - sigma) * latent), then finish
+                    let run = dit.prepare(&cond_final, &vshape, audio_t, sig.to_vec())?;
+                    let mut gen = crate::rng::TorchGen::new(req.seed);
+                    let nv = gen.randn_tensor(&vshape, dev)?;
+                    let na = gen.randn_tensor(&[1, 32, 2, audio_t], dev)?;
+                    let xv = ((nv * sig[0])? + (&zv_up * (1.0 - sig[0]))?)?;
+                    let xa = ((na * sig[0])? + (&first_pass.denoised_a * (1.0 - sig[0]))?)?;
+                    progress::count(Stage::Sampling, split, req.steps);
+                    last = Instant::now();
+                    sampling::sample(&*dit, &run, xv, xa, sig, req.sampler, |i, _| step_log(split + i, &mut last))
+                })();
+                match r {
+                    Ok(o) => break o,
+                    Err(e) if keep > 0 && attempt < 6 && is_oom(&e) => {
+                        keep = keep.saturating_sub(keep.div_ceil(4).max(4));
+                        log::warn(&format!("out of memory in the second pass, retrying with {keep} resident DiT blocks"));
+                        dit.set_resident(keep)?;
+                        crate::kernels::trim_pool();
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            drop(cond_final);
+            // the next request starts with the blocks it was loaded with
+            if keep_models {
+                crate::kernels::trim_pool();
+                dit.set_resident(base_resident)?;
+            }
+            out
+        }
+        _ => (first_pass.xv, first_pass.xa),
+    };
     let audio_scale = dit.audio_scale();
     log::info(&format!("sampling done in {:.1}s", t2.elapsed().as_secs_f64()));
-    drop(run);
     self.release("dit");
     let za = (za / audio_scale)?; // carried -> own audio latent
 
     if let Some(p) = &req.save_latents {
-        let m: std::collections::HashMap<String, Tensor> =
-            [("video".to_string(), zv.to_device(&Device::Cpu)?), ("audio".to_string(), za.to_device(&Device::Cpu)?)].into_iter().collect();
-        candle_core::safetensors::save(&m, p)?;
+        save_latents(p, &zv, &za)?;
         log::info(&format!("latents saved to {p}"));
     }
 
@@ -514,8 +694,8 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     Ok(())
 }
 
-/// Decode latents and mux them into an MP4.
-pub fn decode_and_write(&mut self, zv: &Tensor, za: &Tensor, frame_count: usize, out: &str, crf: u32) -> Result<()> {
+/// Decode a video latent to `[F, 3, H, W]` frames in [0, 1] (at most `frame_count` of them).
+pub fn decode_frames(&mut self, zv: &Tensor, frame_count: usize) -> Result<Tensor> {
     let t = Instant::now();
     progress::stage(Stage::Decoding);
     let frames = self.video_vae()?.decode(zv)?;
@@ -523,6 +703,13 @@ pub fn decode_and_write(&mut self, zv: &Tensor, za: &Tensor, frame_count: usize,
     let nf = frames.dim(1)?.min(frame_count);
     let frames = frames.narrow(1, 0, nf)?.permute((1, 0, 2, 3))?.contiguous()?; // [F, 3, H, W]
     log::info(&format!("video decoded: {nf} frames in {:.1}s", t.elapsed().as_secs_f64()));
+    Ok(frames)
+}
+
+/// Decode latents and mux them into an MP4.
+pub fn decode_and_write(&mut self, zv: &Tensor, za: &Tensor, frame_count: usize, out: &str, crf: u32) -> Result<()> {
+    let frames = self.decode_frames(zv, frame_count)?;
+    let nf = frames.dim(0)?;
     let t = Instant::now();
     progress::stage(Stage::Muxing);
     let avae = self.audio_vae()?;
@@ -554,4 +741,34 @@ pub fn frames_for_latent(t: usize) -> usize {
 pub fn load_latents(path: &str, dev: &Device) -> Result<(Tensor, Tensor)> {
     let m = candle_core::safetensors::load(path, dev)?;
     Ok((m.get("video").context("video latent")?.to_dtype(DType::F32)?, m.get("audio").context("audio latent")?.to_dtype(DType::F32)?))
+}
+
+/// Write sampled latents (`video` `[1, 24, T, H, W]`, `audio` `[1, 32, 2, T]`) for `h3 decode` / `h3 upscale`.
+pub fn save_latents(path: &str, zv: &Tensor, za: &Tensor) -> Result<()> {
+    let m: std::collections::HashMap<String, Tensor> =
+        [("video".to_string(), zv.to_device(&Device::Cpu)?), ("audio".to_string(), za.to_device(&Device::Cpu)?)].into_iter().collect();
+    candle_core::safetensors::save(&m, path)?;
+    Ok(())
+}
+
+/// Upscale a video latent `[1, 24, T, H, W]` to `cells = (height, width)` latent cells with the upscaler
+/// checkpoint at `path`. The model is loaded for the call and dropped again, so it never competes with the DiT.
+pub fn upscale_video_latent(path: &Path, dev: &Device, zv: &Tensor, cells: (usize, usize)) -> Result<Tensor> {
+    let t = Instant::now();
+    progress::stage(Stage::Upscaling);
+    let up = LatentUpscaler::load(path, dev)?;
+    let from = (zv.dim(3)?, zv.dim(4)?);
+    let out = up.upscale(zv, cells.0, cells.1, None)?;
+    dev.synchronize()?;
+    log::info(&format!(
+        "latent upscaled {}x{} -> {}x{} ({:.2}x) in {:.1}s ({})",
+        from.1,
+        from.0,
+        cells.1,
+        cells.0,
+        LatentUpscaler::scale_for(from, cells),
+        t.elapsed().as_secs_f64(),
+        vram()
+    ));
+    Ok(out)
 }

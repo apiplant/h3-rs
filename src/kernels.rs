@@ -426,6 +426,105 @@ extern "C" __global__ void gate_add(const void* x, const void* y, int kind, cons
         stf(out, kind, i, ldf(x, kind, i) + ldf(y, kind, i) * g);
     }
 }
+
+// ---- latent upscaler (frames-first x[T, C, S]: S = H*W) ----
+
+// GroupNorm statistics: block (g * split + k) sums a strided share of group g over all T and S
+// (double accumulators: single pass, no cancellation). Group g is channels [g*cg, (g+1)*cg).
+extern "C" __global__ void gn_partial(const void* x, int kind, unsigned long long T, unsigned long long C,
+                                      unsigned long long S, int groups, int split, double* part) {
+    int g = blockIdx.x / split, k = blockIdx.x % split;
+    unsigned long long cg = C / groups, per = cg * S, n = T * per;
+    double s1 = 0.0, s2 = 0.0;
+    for (unsigned long long e = (unsigned long long)k * blockDim.x + threadIdx.x; e < n;
+         e += (unsigned long long)split * blockDim.x) {
+        unsigned long long t = e / per, r = e % per;
+        double v = (double)ldf(x, kind, t * C * S + (unsigned long long)g * cg * S + r);
+        s1 += v;
+        s2 += v * v;
+    }
+    __shared__ double sh1[256], sh2[256];
+    sh1[threadIdx.x] = s1;
+    sh2[threadIdx.x] = s2;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) {
+            sh1[threadIdx.x] += sh1[threadIdx.x + o];
+            sh2[threadIdx.x] += sh2[threadIdx.x + o];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        part[2 * blockIdx.x] = sh1[0];
+        part[2 * blockIdx.x + 1] = sh2[0];
+    }
+}
+
+// mr[2g] = mean, mr[2g+1] = 1/sqrt(var + eps)
+extern "C" __global__ void gn_final(const double* part, int groups, int split, double n, float eps, float* mr) {
+    int g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups) return;
+    double s1 = 0.0, s2 = 0.0;
+    for (int k = 0; k < split; k++) {
+        s1 += part[2 * (g * split + k)];
+        s2 += part[2 * (g * split + k) + 1];
+    }
+    double mean = s1 / n, var = s2 / n - mean * mean;
+    if (var < 0.0) var = 0.0;
+    mr[2 * g] = (float)mean;
+    mr[2 * g + 1] = (float)rsqrt(var + (double)eps);
+}
+
+// out = silu((x - mean) * rstd * gamma[c] + beta[c])
+extern "C" __global__ void gn_silu(const void* x, int kind, unsigned long long T, unsigned long long C,
+                                   unsigned long long S, int groups, const float* mr, const float* gamma,
+                                   const float* beta, void* out) {
+    unsigned long long n = T * C * S, cg = C / groups;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long c = (i / S) % C;
+        int g = (int)(c / cg);
+        float y = (ldf(x, kind, i) - mr[2 * g]) * mr[2 * g + 1] * gamma[c] + beta[c];
+        stf(out, kind, i, y / (1.f + __expf(-y)));
+    }
+}
+
+// depthwise conv over T (zero padded, K taps centered), per channel weights w[C, K] and bias b[C]
+extern "C" __global__ void dw_time(const void* x, int kind, const float* w, const float* b, void* out,
+                                   unsigned long long T, unsigned long long C, unsigned long long S, int K) {
+    unsigned long long n = T * C * S;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long s = i % S, c = (i / S) % C;
+        long long t = (long long)(i / (S * C));
+        float acc = b[c];
+        for (int k = 0; k < K; k++) {
+            long long tt = t + k - K / 2;
+            if (tt >= 0 && tt < (long long)T) acc += w[c * K + k] * ldf(x, kind, ((unsigned long long)tt * C + c) * S + s);
+        }
+        stf(out, kind, i, acc);
+    }
+}
+
+// bilinear resize of planes x[N, H, W] -> [N, Ho, Wo], align_corners = false (PyTorch)
+extern "C" __global__ void bilinear_hw(const void* x, int kind, void* out, unsigned long long N, int H, int W,
+                                       int Ho, int Wo) {
+    unsigned long long n = N * Ho * Wo;
+    float sy = (float)H / (float)Ho, sx = (float)W / (float)Wo;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        int ox = (int)(i % Wo), oy = (int)((i / Wo) % Ho);
+        unsigned long long p = i / ((unsigned long long)Wo * Ho);
+        float fy = fmaxf(sy * ((float)oy + 0.5f) - 0.5f, 0.f), fx = fmaxf(sx * ((float)ox + 0.5f) - 0.5f, 0.f);
+        int y0 = (int)fy, x0 = (int)fx;
+        int y1 = min(y0 + 1, H - 1), x1 = min(x0 + 1, W - 1);
+        float ly = fy - (float)y0, lx = fx - (float)x0;
+        const unsigned long long base = p * (unsigned long long)H * W;
+        float a = ldf(x, kind, base + (unsigned long long)y0 * W + x0), bb = ldf(x, kind, base + (unsigned long long)y0 * W + x1);
+        float c = ldf(x, kind, base + (unsigned long long)y1 * W + x0), d = ldf(x, kind, base + (unsigned long long)y1 * W + x1);
+        stf(out, kind, i, (a * (1.f - lx) + bb * lx) * (1.f - ly) + (c * (1.f - lx) + d * lx) * ly);
+    }
+}
 "#;
 
 fn ptx() -> Result<&'static str> {
@@ -1102,4 +1201,128 @@ impl CustomOp2 for RmsModulate {
 pub fn rms_modulate(x: &Tensor, w: &Tensor, eps: f32, scale: &Tensor, shift: &Tensor, idx: &Tensor) -> Result<Tensor> {
     let op = RmsModulate { w: w.to_dtype(x.dtype())?.contiguous()?, eps, shift: shift.contiguous()?, idx: idx.contiguous()? };
     x.contiguous()?.apply_op2_no_bwd(&scale.contiguous()?, &op)
+}
+
+// ---------------------------------------------------------------------------------------------
+// latent upscaler kernels (see `upscaler.rs`); tensors are frames-first `[T, C, H, W]`.
+
+const GN_SPLIT: usize = 64;
+
+struct GroupNormSilu {
+    groups: usize,
+    eps: f32,
+}
+impl CustomOp3 for GroupNormSilu {
+    fn name(&self) -> &'static str {
+        "group_norm_silu"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("group_norm_silu: cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout, g: &CudaStorage, gl: &Layout, b: &CudaStorage, bl: &Layout) -> Result<(CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+        need_contig(xl, "group_norm x")?;
+        need_contig(gl, "group_norm gamma")?;
+        need_contig(bl, "group_norm beta")?;
+        let (t, c, h, w) = xl.shape().dims4()?;
+        let s = h * w;
+        if c % self.groups != 0 {
+            candle_core::bail!("group_norm: {c} channels not divisible by {} groups", self.groups);
+        }
+        let dev = x.device().clone();
+        let n = t * c * s;
+        let part = unsafe { dev.alloc::<f64>(2 * self.groups * GN_SPLIT)? };
+        let mr = unsafe { dev.alloc::<f32>(2 * self.groups)? };
+        let out = alloc_out(&dev, x.dtype(), n)?;
+        let stream = dev.cuda_stream();
+        let (pp, mp) = (part.device_ptr(&stream).0, mr.device_ptr(&stream).0);
+        let (xp, gp, bp, op) = (dev_ptr(x, xl)?, dev_ptr(g, gl)?, dev_ptr(b, bl)?, out_ptr(&out)?);
+        let (tu, cu, su, grp, split, k) = (t as u64, c as u64, s as u64, self.groups as i32, GN_SPLIT as i32, kind_of(x.dtype())?);
+        let f_part = dev.get_or_load_custom_func("gn_partial", MODULE, ptx()?)?;
+        let mut bd = f_part.builder();
+        bd.arg(&xp).arg(&k).arg(&tu).arg(&cu).arg(&su).arg(&grp).arg(&split).arg(&pp);
+        let cfg = LaunchConfig { grid_dim: ((self.groups * GN_SPLIT) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { bd.launch(cfg) }.w()?;
+        let f_fin = dev.get_or_load_custom_func("gn_final", MODULE, ptx()?)?;
+        let per = (t * (c / self.groups) * s) as f64;
+        let mut bd = f_fin.builder();
+        bd.arg(&pp).arg(&grp).arg(&split).arg(&per).arg(&self.eps).arg(&mp);
+        unsafe { bd.launch(grid_for(self.groups)) }.w()?;
+        let f_app = dev.get_or_load_custom_func("gn_silu", MODULE, ptx()?)?;
+        let mut bd = f_app.builder();
+        bd.arg(&xp).arg(&k).arg(&tu).arg(&cu).arg(&su).arg(&grp).arg(&mp).arg(&gp).arg(&bp).arg(&op);
+        unsafe { bd.launch(grid_for(n)) }.w()?;
+        Ok((out, xl.shape().clone()))
+    }
+}
+
+/// `silu(group_norm(x) * gamma + beta)` on frames-first `x [T, C, H, W]`: `groups` groups of
+/// contiguous channels, statistics over all frames and pixels of a group (3D GroupNorm, as in the
+/// reference's `nn.GroupNorm` on `[1, C, T, H, W]`). `gamma`/`beta` are f32 `[C]`.
+pub fn group_norm_silu(x: &Tensor, gamma: &Tensor, beta: &Tensor, groups: usize, eps: f32) -> Result<Tensor> {
+    x.contiguous()?.apply_op3_no_bwd(&gamma.contiguous()?, &beta.contiguous()?, &GroupNormSilu { groups, eps })
+}
+
+struct DwTime;
+impl CustomOp3 for DwTime {
+    fn name(&self) -> &'static str {
+        "dw_time"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("dw_time: cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout, w: &CudaStorage, wl: &Layout, b: &CudaStorage, bl: &Layout) -> Result<(CudaStorage, Shape)> {
+        need_contig(xl, "dw_time x")?;
+        need_contig(wl, "dw_time w")?;
+        need_contig(bl, "dw_time b")?;
+        let (t, c, h, wd) = xl.shape().dims4()?;
+        let k = wl.shape().dims2()?.1;
+        let dev = x.device().clone();
+        let n = t * c * h * wd;
+        let func = dev.get_or_load_custom_func("dw_time", MODULE, ptx()?)?;
+        let out = alloc_out(&dev, x.dtype(), n)?;
+        let (xp, wp, bp, op) = (dev_ptr(x, xl)?, dev_ptr(w, wl)?, dev_ptr(b, bl)?, out_ptr(&out)?);
+        let (kind, tu, cu, su, ki) = (kind_of(x.dtype())?, t as u64, c as u64, (h * wd) as u64, k as i32);
+        let mut bd = func.builder();
+        bd.arg(&xp).arg(&kind).arg(&wp).arg(&bp).arg(&op).arg(&tu).arg(&cu).arg(&su).arg(&ki);
+        unsafe { bd.launch(grid_for(n)) }.w()?;
+        Ok((out, xl.shape().clone()))
+    }
+}
+
+/// Depthwise conv over the frame axis of `x [T, C, H, W]`: `w` f32 `[C, K]`, `b` f32 `[C]`, zero padded.
+pub fn dw_time(x: &Tensor, w: &Tensor, b: &Tensor) -> Result<Tensor> {
+    x.contiguous()?.apply_op3_no_bwd(&w.contiguous()?, &b.contiguous()?, &DwTime)
+}
+
+struct BilinearHw {
+    ho: usize,
+    wo: usize,
+}
+impl CustomOp1 for BilinearHw {
+    fn name(&self) -> &'static str {
+        "bilinear_hw"
+    }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("bilinear_hw: cuda only")
+    }
+    fn cuda_fwd(&self, x: &CudaStorage, xl: &Layout) -> Result<(CudaStorage, Shape)> {
+        need_contig(xl, "bilinear x")?;
+        let (t, c, h, w) = xl.shape().dims4()?;
+        let dev = x.device().clone();
+        let n = t * c * self.ho * self.wo;
+        let func = dev.get_or_load_custom_func("bilinear_hw", MODULE, ptx()?)?;
+        let out = alloc_out(&dev, x.dtype(), n)?;
+        let (xp, op) = (dev_ptr(x, xl)?, out_ptr(&out)?);
+        let (kind, planes, hi, wi, ho, wo) = (kind_of(x.dtype())?, (t * c) as u64, h as i32, w as i32, self.ho as i32, self.wo as i32);
+        let mut bd = func.builder();
+        bd.arg(&xp).arg(&kind).arg(&op).arg(&planes).arg(&hi).arg(&wi).arg(&ho).arg(&wo);
+        unsafe { bd.launch(grid_for(n)) }.w()?;
+        Ok((out, Shape::from((t, c, self.ho, self.wo))))
+    }
+}
+
+/// Bilinear resize (PyTorch `align_corners=False`) of the last two dims of `x [T, C, H, W]`.
+pub fn bilinear_hw(x: &Tensor, ho: usize, wo: usize) -> Result<Tensor> {
+    x.contiguous()?.apply_op1_no_bwd(&BilinearHw { ho, wo })
 }

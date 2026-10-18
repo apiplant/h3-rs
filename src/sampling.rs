@@ -31,7 +31,23 @@ pub enum Sampler {
 
 /// Run the sampler over the packed (video, carried audio) latent. `on_step(i, n)` is called
 /// after each step.
-pub fn sample(
+pub fn sample(dit: &Dit, run: &DitRun, xv: Tensor, xa: Tensor, sigmas: &[f64], sampler: Sampler, on_step: impl FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
+    let s = sample_denoised(dit, run, xv, xa, sigmas, sampler, on_step)?;
+    Ok((s.xv, s.xa))
+}
+
+/// What a sampler run ends with: the final latents and the last denoised (x0) prediction. For a
+/// schedule that ends above 0 (the first half of a two-pass run) the prediction is the clean estimate
+/// worth carrying on, like ComfyUI's `SamplerCustomAdvanced` `denoised_output`.
+pub struct Sampled {
+    pub xv: Tensor,
+    pub xa: Tensor,
+    pub denoised_v: Tensor,
+    pub denoised_a: Tensor,
+}
+
+/// [`sample`], also returning the last denoised prediction.
+pub fn sample_denoised(
     dit: &Dit,
     run: &DitRun,
     mut xv: Tensor,
@@ -39,10 +55,11 @@ pub fn sample(
     sigmas: &[f64],
     sampler: Sampler,
     mut on_step: impl FnMut(usize, usize),
-) -> Result<(Tensor, Tensor)> {
+) -> Result<Sampled> {
     let mut old: Option<(Tensor, Tensor)> = None;
     let mut old_sigma_down: Option<f64> = None;
     let n = sigmas.len() - 1;
+    let mut last: Option<(Tensor, Tensor)> = None;
     for i in 0..n {
         let (s, s_next) = (sigmas[i], sigmas[i + 1]);
         let (ov, oa) = dit.forward(run, &xv, &xa, s)?;
@@ -67,10 +84,12 @@ pub fn sample(
             xv = ((&xv * e)? + ((&dv * (h * b1))? + (odv * (h * b2))?)?)?;
             xa = ((&xa * e)? + ((&da * (h * b1))? + (oda * (h * b2))?)?)?;
         }
-        old = Some((dv, da));
+        old = Some((dv.clone(), da.clone()));
+        last = Some((dv, da));
         old_sigma_down = Some(s_next);
         on_step(i + 1, n);
         crate::dit::prof::dump();
     }
-    Ok((xv, xa))
+    let (denoised_v, denoised_a) = last.ok_or_else(|| anyhow::anyhow!("sigma schedule needs at least 2 values"))?;
+    Ok(Sampled { xv, xa, denoised_v, denoised_a })
 }

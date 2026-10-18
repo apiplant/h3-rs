@@ -17,6 +17,8 @@ pub enum Stage {
     Decoding = 3,
     /// Audio decode and MP4 mux
     Muxing = 4,
+    /// Latent upscaler between the two sampling passes of an upscaled request
+    Upscaling = 5,
 }
 
 impl Stage {
@@ -27,6 +29,7 @@ impl Stage {
             Stage::Sampling => "sampling",
             Stage::Decoding => "decoding",
             Stage::Muxing => "muxing",
+            Stage::Upscaling => "upscaling",
         }
     }
 }
@@ -60,6 +63,7 @@ pub fn snapshot() -> (Stage, u32, u32) {
         2 => Stage::Sampling,
         3 => Stage::Decoding,
         4 => Stage::Muxing,
+        5 => Stage::Upscaling,
         _ => Stage::Idle,
     };
     (s, DONE.load(Relaxed), TOTAL.load(Relaxed))

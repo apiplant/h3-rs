@@ -14,6 +14,7 @@ pub mod sampling;
 #[cfg(feature = "serve")]
 pub mod serve;
 pub mod text;
+pub mod upscaler;
 pub mod vae_audio;
 pub mod vae_video;
 pub mod weights;

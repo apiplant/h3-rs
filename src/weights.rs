@@ -329,6 +329,30 @@ impl Held {
     pub fn on_gpu(&self) -> bool {
         matches!(self, Held::Dev(_))
     }
+
+    /// Move a device-resident byte tensor (an int8 / fp4 weight) to pinned host memory; its VRAM is
+    /// released once the last handle to it drops. Other holders are left alone.
+    pub fn demote(&mut self, dev: &Device) -> Result<()> {
+        if let Held::Dev(t) = self {
+            if t.dtype() == DType::U8 {
+                let host = t.to_device(&Device::Cpu)?;
+                let shape = host.dims().to_vec();
+                *self = match pin_bytes(&host.flatten_all()?.to_vec1::<u8>()?, dev) {
+                    Some(buf) => Held::Pinned { buf, shape },
+                    None => Held::Host(host),
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Upload a host-held tensor back to the device (the inverse of [`demote`](Self::demote)).
+    pub fn promote(&mut self, dev: &Device) -> Result<()> {
+        if matches!(self, Held::Pinned { .. } | Held::Host(_)) {
+            *self = Held::Dev(self.get(dev)?);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +379,16 @@ pub struct LoraDelta {
 pub struct Raw {
     pub w: Tensor,
     pub bs: Option<Tensor>,
+}
+
+impl Raw {
+    /// Output rows `[r0, r0 + n)` of an int8 weight (pairs with [`QLinear::rows`]).
+    pub fn rows(&self, r0: usize, n: usize) -> Result<Raw> {
+        if self.bs.is_some() {
+            bail!("row slices of block-scaled weights are not supported");
+        }
+        Ok(Raw { w: self.w.narrow(0, r0, n)?, bs: None })
+    }
 }
 
 #[derive(Clone)]
@@ -467,6 +501,25 @@ impl QLinear {
             loras: vec![],
             interleaved: false,
         })
+    }
+
+    /// This layer restricted to output rows `[r0, r0 + n)`: the same linear for a head group of a fused
+    /// projection, to run against [`Raw::rows`]. Needs no LoRA deltas and a plain (int8 / dense) weight.
+    pub fn rows(&self, r0: usize, n: usize, dev: &Device) -> Result<QLinear> {
+        if !self.loras.is_empty() || self.interleaved || self.block_scale.is_some() {
+            bail!("{}: cannot slice rows of this layer", self.name);
+        }
+        let mut l = self.clone();
+        l.out_features = n;
+        if let Some(sc) = &self.scale {
+            let t = sc.get(dev)?;
+            if t.elem_count() == self.out_features {
+                let rows = t.flatten_all()?.narrow(0, r0, n)?.contiguous()?;
+                l.scale = Some(Held::from_tensor(if t.rank() == 2 { rows.reshape((n, 1))? } else { rows }));
+            }
+        }
+        l.bias = self.bias.as_ref().map(|b| b.narrow(0, r0, n).and_then(|t| t.contiguous())).transpose()?;
+        Ok(l)
     }
 
     pub fn weight_bytes(&self) -> usize {

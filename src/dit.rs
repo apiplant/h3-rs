@@ -335,6 +335,9 @@ struct RefinerBlock {
     fc2: QLinear,
 }
 
+/// Largest fused qkv (bytes) a block's attention materializes at once; longer sequences go in head groups.
+const ATTN_QKV_BUDGET: usize = 1_500_000_000;
+
 pub struct Dit {
     pub cfg: DitConfig,
     dev: Device,
@@ -349,6 +352,10 @@ pub struct Dit {
     refiner: Vec<RefinerBlock>,
     refiner_norm: Tensor,
     blocks: Vec<Block>,
+    /// Blocks whose weights sit in VRAM now, and how many were at load (`set_resident` moves in between).
+    resident: usize,
+    base_resident: usize,
+    block_bytes: usize,
     final_norm: Tensor,
     final_adaln: QLinear,
     video_out: QLinear,
@@ -361,6 +368,7 @@ pub struct Dit {
 }
 
 /// Conditioning for one sampling run.
+#[derive(Clone)]
 pub struct DitCond {
     /// Qwen3-VL hidden states `[L, text_dim]` (or already refined `[L, hidden]`).
     pub text: Tensor,
@@ -373,6 +381,7 @@ pub struct DitCond {
     pub audio_cond_noise_aug: f64,
 }
 
+#[derive(Clone)]
 pub struct KeyframeCond {
     pub frame_index: usize,
     /// Normalized video latent `[1, 24, t, h, w]`.
@@ -381,6 +390,7 @@ pub struct KeyframeCond {
     pub audio: Option<Tensor>,
 }
 
+#[derive(Clone)]
 pub enum RefCond {
     Image { latent: Tensor },
     Audio { latent: Tensor },
@@ -497,6 +507,9 @@ impl Dit {
             refiner,
             refiner_norm: ld(&f, "token_refiner.final_norm.weight", dev, dtype)?,
             blocks,
+            resident,
+            base_resident: resident,
+            block_bytes,
             final_norm: ld(&f, "final_layer.norm.weight", dev, dtype)?,
             final_adaln: dense_f32(&f, "final_layer.adaln_proj.linear", dev)?,
             video_out: dense_f32(&f, "final_layer.video_out", dev)?,
@@ -529,6 +542,40 @@ impl Dit {
             }
         }
         Ok(dit)
+    }
+
+    /// Blocks resident in VRAM now.
+    pub fn resident_blocks(&self) -> usize {
+        self.resident
+    }
+
+    /// Blocks resident when the DiT was loaded (the most `set_resident` brings back).
+    pub fn base_resident_blocks(&self) -> usize {
+        self.base_resident
+    }
+
+    /// VRAM held by one block's weights.
+    pub fn block_bytes(&self) -> usize {
+        self.block_bytes
+    }
+
+    /// Keep only the first `n` of the loaded-resident blocks in VRAM: the rest stream from pinned RAM every
+    /// step, like the blocks that never fit. Used to open up room for a run with more tokens than the load-time
+    /// budget assumed (the second, larger pass of an upscaled request), and to take the blocks back afterwards.
+    pub fn set_resident(&mut self, n: usize) -> Result<()> {
+        let n = n.min(self.base_resident);
+        let dev = self.dev.clone();
+        for (i, b) in self.blocks.iter_mut().enumerate().take(self.base_resident) {
+            for l in [&mut b.qkv, &mut b.out, &mut b.fc1, &mut b.fc2] {
+                if i >= n {
+                    l.weight.demote(&dev)?;
+                } else {
+                    l.weight.promote(&dev)?;
+                }
+            }
+        }
+        self.resident = n;
+        Ok(())
     }
 
     fn apply_lora(&mut self, lora: &Lora, strength: f64) -> Result<()> {
@@ -633,6 +680,51 @@ impl Dit {
         let v = qkv.narrow(1, 2 * inner, inner)?.contiguous()?.reshape((s, h, d))?;
         let o = ops::attention(&q.unsqueeze(0)?, &k.unsqueeze(0)?, &v.unsqueeze(0)?, false)?;
         Ok(o.reshape((s, inner))?)
+    }
+
+    /// How many head groups the attention of a block runs in. The fused qkv is 3x a token stream, and with q, k and
+    /// the f16 copy of v alive next to it that is most of the memory of a long sequence (an upscaled request's second
+    /// pass has ~150k tokens). Head groups project, rope and attend `heads / groups` heads at a time, so the full
+    /// qkv never exists. Results are the same; short sequences keep the single fused projection.
+    fn attn_groups(&self, tokens: usize, lin: &QLinear) -> usize {
+        if let Some(g) = std::env::var("H3_ATTN_GROUPS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            return if g >= 1 && self.cfg.heads % g == 0 { g } else { 1 };
+        }
+        let qkv_bytes = 3 * tokens * self.cfg.hidden * 2;
+        let ok = lin.loras.is_empty() && !lin.interleaved && lin.block_scale.is_none() && crate::attn8::available_arch(&self.dev) && self.cfg.head_dim == 128;
+        if !ok || qkv_bytes <= ATTN_QKV_BUDGET {
+            return 1;
+        }
+        let want = qkv_bytes.div_ceil(ATTN_QKV_BUDGET);
+        (want..=self.cfg.heads).find(|g| self.cfg.heads % g == 0).unwrap_or(self.cfg.heads)
+    }
+
+    /// Attention of one block, `groups` heads groups at a time (see [`attn_groups`](Self::attn_groups)); consumes
+    /// `n1`, the modulated input of the qkv projection.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_grouped(&self, b: &Block, n1: Tensor, r_qkv: &crate::weights::Raw, rope: &Tensor, rot: usize, groups: usize, chunk: usize) -> Result<Tensor> {
+        let (h, d) = (self.cfg.heads, self.cfg.head_dim);
+        let inner = h * d;
+        let (hg, w) = (h / groups, h / groups * d);
+        let s = n1.dim(0)?;
+        let proj = |base: usize, g: usize| -> Result<Tensor> {
+            let r0 = base + g * w;
+            b.qkv.rows(r0, w, &self.dev)?.forward_raw(&n1, &r_qkv.rows(r0, w)?, chunk)
+        };
+        let mut outs = Vec::with_capacity(groups);
+        for g in 0..groups {
+            let qt = prof::time("qkv linear", &self.dev, || proj(0, g))?;
+            let q = kernels::qk_norm_rope(&qt, 0, hg, d, Some((Some(&b.q_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
+            drop(qt);
+            let kt = prof::time("qkv linear", &self.dev, || proj(inner, g))?;
+            let k = kernels::qk_norm_rope(&kt, 0, hg, d, Some((Some(&b.k_norm), self.cfg.eps)), Some(rope), rot, self.dtype)?;
+            drop(kt);
+            let vt = prof::time("qkv linear", &self.dev, || proj(2 * inner, g))?;
+            let o = prof::time("attention", &self.dev, || crate::attn8::attention_qkv(&q, &k, &vt, 0))?;
+            outs.push(o.reshape((s, w))?);
+        }
+        drop(n1);
+        Ok(if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 1)? })
     }
 
     fn rope_angles(&self, layout: &PackedLayout) -> Result<Tensor> {
@@ -861,10 +953,16 @@ impl Dit {
             let (shift_mlp, scale_mlp, gate_mlp) = (c(3)?, c(4)?, c(5)?);
 
             let n1 = prof::time("norm/mod", dev, || -> Result<Tensor> { Ok(kernels::rms_modulate(&x, &b.norm1, self.cfg.eps, &scale_msa, &shift_msa, &idx)?) })?;
-            let qkv = prof::time("qkv linear", dev, || b.qkv.forward_raw(&n1, &r_qkv, chunk))?;
-            drop(n1);
-            let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(&run.rope), rot, h, d))?;
-            drop(qkv);
+            let groups = self.attn_groups(n1.dim(0)?, &b.qkv);
+            let att = if groups > 1 {
+                self.attend_grouped(b, n1, &r_qkv, &run.rope, rot, groups, chunk)?
+            } else {
+                let qkv = prof::time("qkv linear", dev, || b.qkv.forward_raw(&n1, &r_qkv, chunk))?;
+                drop(n1);
+                let att = prof::time("attention", dev, || self.attend(&qkv, Some((&b.q_norm, &b.k_norm)), Some(&run.rope), rot, h, d))?;
+                drop(qkv);
+                att
+            };
             let o = prof::time("out linear", dev, || b.out.forward_raw(&att, &r_out, chunk))?;
             drop(att);
             x = prof::time("norm/mod", dev, || kernels::gate_add(&x, &o, &gate_msa, &idx))?;

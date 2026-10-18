@@ -22,6 +22,10 @@ export interface GenerateRequest {
   ref_image_size?: "match" | "max";
   lora?: string;
   lora_strength?: number;
+  /** Sample at 1/N of the size, upscale the latent, refine at full size. */
+  upscale?: number;
+  /** With `upscale`: fraction of the steps sampled at the low resolution. */
+  upscale_split?: number;
   crf?: number;
 }
 
@@ -32,6 +36,8 @@ export interface Info {
   text_encoder: string;
   default_steps: number;
   default_lora: string | null;
+  /** Latent upscaler checkpoint, when the server found one. */
+  upscaler: string | null;
   loras: string[];
   queued: number;
 }
@@ -39,7 +45,7 @@ export interface Info {
 export interface Status {
   state: "idle" | "starting" | "running";
   queued: number;
-  stage: "idle" | "encoding" | "sampling" | "decoding" | "muxing";
+  stage: "idle" | "encoding" | "sampling" | "upscaling" | "decoding" | "muxing";
   done: number;
   total: number;
 }

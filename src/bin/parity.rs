@@ -1,6 +1,6 @@
 //! Parity checks against reference dumps written by `tools/ref_*.py` (ComfyUI).
 //!
-//! usage: parity <ref_dir> <check>...   checks: dequant, dit, te, vae, audio
+//! usage: parity <ref_dir> <check>...   checks: dequant, dit, te, vae, audio, upscaler, upscaler_stages
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
@@ -127,6 +127,34 @@ fn main() -> Result<()> {
                 let r = SafeFile::open(format!("{dir}/aenc.safetensors"))?;
                 let e = h3_rs::vae_audio::AudioEncoder::load(&format!("{M}/vae/minimax_h3_audio_vae_fp32.safetensors"), &dev)?;
                 report("audio encode", &e.encode(&r.load("wave", &dev)?)?, &r.load("z", &dev)?)?;
+            }
+            "upscaler" => {
+                let r = SafeFile::open(format!("{dir}/upscaler.safetensors"))?;
+                let up = h3_rs::upscaler::LatentUpscaler::load(format!("{M}/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors"), &dev)?;
+                for c in ["a", "b", "c"] {
+                    let z = r.load(&format!("{c}_z"), &dev)?;
+                    let want = r.load(&format!("{c}_f16"), &dev)?;
+                    let (ho, wo) = (want.dim(3)?, want.dim(4)?);
+                    let scale = r.load(&format!("{c}_scale"), &Device::Cpu)?.to_vec1::<f32>()?[0] as f64;
+                    let t = std::time::Instant::now();
+                    let got = up.upscale(&z, ho, wo, Some(scale))?;
+                    dev.synchronize()?;
+                    println!("case {c}: {:?} -> {:?} in {:.2}s", z.dims(), got.dims(), t.elapsed().as_secs_f64());
+                    report(&format!("upscaler {c} vs torch f16"), &got, &want)?;
+                    report(&format!("upscaler {c} vs torch f32"), &got, &r.load(&format!("{c}_f32"), &dev)?)?;
+                    report(&format!("  (torch f16 vs torch f32)"), &want, &r.load(&format!("{c}_f32"), &dev)?)?;
+                }
+            }
+            "upscaler_stages" => {
+                let r = SafeFile::open(format!("{dir}/upscaler_stages.safetensors"))?;
+                let dt = if std::env::var("H3_F32").is_ok() { DType::F32 } else { DType::F16 };
+                let up = h3_rs::upscaler::LatentUpscaler::load_as(format!("{M}/latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors"), &dev, dt)?;
+                let x = r.load("s_x", &dev)?.squeeze(0)?.permute((1, 0, 2, 3))?.contiguous()?;
+                let scale = r.load("s_scale", &Device::Cpu)?.to_vec1::<f32>()?[0] as f64;
+                for (name, got) in up.stages(&x, scale, 17, 22)? {
+                    let want = r.load(&format!("s_{name}"), &dev)?.squeeze(0)?.permute((1, 0, 2, 3))?;
+                    report(&format!("stage {name}"), &got, &want)?;
+                }
             }
             c => anyhow::bail!("unknown check {c}"),
         }

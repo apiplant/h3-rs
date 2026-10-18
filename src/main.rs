@@ -34,6 +34,9 @@ struct Models {
     video_vae: String,
     #[arg(long, default_value = "minimax_h3_audio_vae_fp32.safetensors")]
     audio_vae: String,
+    /// Latent upscaler (models/latent_upscale_models) for `--upscale` and `h3 upscale`.
+    #[arg(long, default_value = pipeline::DEFAULT_UPSCALER)]
+    upscaler: String,
 }
 
 #[derive(clap::Args, Clone)]
@@ -153,9 +156,16 @@ enum Cmd {
         lora: Option<String>,
         #[arg(long, default_value_t = 1.0)]
         lora_strength: f64,
+        /// Sample at the canvas size, upscale the latent SCALE times, and refine the rest of the steps at that
+        /// larger size, which is what you get (1 < SCALE <= 4; needs the latent upscaler model).
+        #[arg(long)]
+        upscale: Option<f64>,
+        /// With --upscale: fraction of the steps sampled at the low resolution.
+        #[arg(long, default_value_t = 0.5)]
+        upscale_split: f64,
         #[arg(long, short, default_value = "h3_output.mp4")]
         output: String,
-        /// Also save the sampled latents (safetensors) for `h3 decode`.
+        /// Also save the sampled latents (safetensors) for `h3 decode` / `h3 upscale`.
         #[arg(long)]
         save_latents: Option<String>,
         #[arg(long, default_value_t = 18)]
@@ -170,6 +180,32 @@ enum Cmd {
         latents: String,
         #[arg(long, short, default_value = "h3_output.mp4")]
         output: String,
+        #[command(flatten)]
+        models: Models,
+        #[command(flatten)]
+        mem: Mem,
+    },
+    /// Upscale a video file (its audio is kept) or saved latents (`generate --save-latents`) with the latent
+    /// upscaler: encode, upscale in latent space, decode. This is the raw learned upscale;
+    /// `generate --upscale` also re-noises and refines it with the DiT.
+    Upscale {
+        /// A video file, or latents saved by `generate --save-latents` (`.safetensors`).
+        input: String,
+        /// Upscale factor (1 - 4) applied to the input's size (default 1.5).
+        #[arg(long, conflicts_with_all = ["width", "height"])]
+        scale: Option<f64>,
+        /// Target width in pixels (rounded to 32); the height follows the aspect unless --height is given.
+        #[arg(long)]
+        width: Option<usize>,
+        #[arg(long)]
+        height: Option<usize>,
+        #[arg(long, short, default_value = "h3_upscaled.mp4")]
+        output: String,
+        /// Also save the upscaled latents (latents input only).
+        #[arg(long)]
+        save_latents: Option<String>,
+        #[arg(long, default_value_t = 18)]
+        crf: u32,
         #[command(flatten)]
         models: Models,
         #[command(flatten)]
@@ -233,6 +269,8 @@ fn main() -> Result<()> {
             audio_guide,
             lora,
             lora_strength,
+            upscale,
+            upscale_split,
             output,
             save_latents,
             crf,
@@ -249,7 +287,8 @@ fn main() -> Result<()> {
             }
             refs.extend(ref_audio.into_iter().map(pipeline::RefInput::Audio));
             let default_dit = if refs.is_empty() { "minimax_h3_fl2va_pruned_int8_convrot.safetensors" } else { "minimax_h3_ref2va_pruned_int8_convrot.safetensors" };
-            let paths = ModelPaths::resolve(&models.models_dir, models.dit.as_deref().unwrap_or(default_dit), &models.text_encoder, &models.video_vae, &models.audio_vae)?;
+            let paths = ModelPaths::resolve(&models.models_dir, models.dit.as_deref().unwrap_or(default_dit), &models.text_encoder, &models.video_vae, &models.audio_vae)?
+                .with_upscaler(&models.models_dir, &models.upscaler, upscale.is_some())?;
             let aspect = match aspect {
                 Some(a) => {
                     let (x, y) = a.split_once(':').ok_or_else(|| anyhow::anyhow!("--aspect must look like 16:9"))?;
@@ -284,6 +323,7 @@ fn main() -> Result<()> {
                 last_frame: last_image,
                 lora,
                 audio_guide,
+                upscale: upscale.map(|scale| pipeline::Upscale { scale, split: upscale_split }),
                 output,
                 save_latents,
                 crf,
@@ -300,7 +340,7 @@ fn main() -> Result<()> {
                 memc.vae_resident = false;
             }
             let dit = models.dit.clone().unwrap_or_else(|| "minimax_h3_fl2va_pruned_int8_convrot.safetensors".into());
-            let paths = ModelPaths::resolve(&models.models_dir, &dit, &models.text_encoder, &models.video_vae, &models.audio_vae)?;
+            let paths = ModelPaths::resolve(&models.models_dir, &dit, &models.text_encoder, &models.video_vae, &models.audio_vae)?.with_upscaler(&models.models_dir, &models.upscaler, false)?;
             let ref_dit = models.models_dir.join("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
             let ref_dit = ref_dit.is_file().then_some(ref_dit);
             let loras_dir = models.models_dir.join("loras");
@@ -311,7 +351,7 @@ fn main() -> Result<()> {
             let info = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "dit": paths.dit, "ref_dit": ref_dit, "text_encoder": paths.text_encoder,
-                "video_vae": paths.video_vae, "audio_vae": paths.audio_vae,
+                "video_vae": paths.video_vae, "audio_vae": paths.audio_vae, "upscaler": paths.upscaler,
                 "default_steps": steps, "default_lora": lora.as_ref().map(|l| l.0.clone()),
                 "memory": memc,
             });
@@ -329,6 +369,72 @@ fn main() -> Result<()> {
                 &addr,
                 info,
             )?;
+        }
+        Cmd::Upscale { input, scale, width, height, output, save_latents, crf, models, mem } => {
+            let memc = mem.resolve()?;
+            let dev = candle_core::Device::new_cuda(mem.device)?;
+            h3_rs::kernels::keep_pool_memory(&dev);
+            let paths = ModelPaths::resolve(&models.models_dir, models.dit.as_deref().unwrap_or("minimax_h3_fl2va_pruned_int8_convrot.safetensors"), &models.text_encoder, &models.video_vae, &models.audio_vae)?
+                .with_upscaler(&models.models_dir, &models.upscaler, true)?;
+            let is_video = !input.ends_with(".safetensors");
+            // a video is encoded to latents first (whole 17-frame clips, centre-cropped to a multiple of 16 px)
+            let (zv, za, source) = if is_video {
+                let raw = h3_rs::media::load_video(&input, pipeline::FPS as f64, pipeline::FPS * 30)?;
+                let mut n = raw.dim(0)?;
+                if n < 5 {
+                    anyhow::bail!("{input} has fewer than 5 frames");
+                }
+                while n % 17 != 5 {
+                    n -= 1;
+                }
+                let (vh, vw) = (raw.dim(1)?, raw.dim(2)?);
+                let (ch, cw) = (vh / 16 * 16, vw / 16 * 16);
+                let frames = raw.narrow(0, 0, n)?.narrow(1, (vh - ch) / 2, ch)?.narrow(2, (vw - cw) / 2, cw)?.contiguous()?;
+                let mut eng = pipeline::Engine::new(paths.clone(), None, memc.clone(), dev.clone(), false);
+                let t = std::time::Instant::now();
+                let z = eng.video_vae()?.encode_frames(&frames)?;
+                eprintln!("[h3] encoded {n} frames at {cw}x{ch} in {:.1}s", t.elapsed().as_secs_f64());
+                (z, None, Some((frames.dim(0)?, input.clone())))
+            } else {
+                let (zv, za) = pipeline::load_latents(&input, &dev)?;
+                (zv, Some(za), None)
+            };
+            let (h, w) = (zv.dim(3)?, zv.dim(4)?);
+            // pixel target rounded to 32, like the canvas of a generation
+            let r32 = |v: f64| ((v / 32.0).round() as usize * 32).max(32);
+            let (tw, th) = match (scale, width, height) {
+                (_, Some(tw), Some(th)) => (r32(tw as f64), r32(th as f64)),
+                (_, Some(tw), None) => (r32(tw as f64), r32(tw as f64 * h as f64 / w as f64)),
+                (_, None, Some(th)) => (r32(th as f64 * w as f64 / h as f64), r32(th as f64)),
+                (s, None, None) => {
+                    let s = s.unwrap_or(1.5);
+                    (r32(w as f64 * 16.0 * s), r32(h as f64 * 16.0 * s))
+                }
+            };
+            let zv = pipeline::upscale_video_latent(paths.upscaler.as_ref().unwrap(), &dev, &zv, (th / 16, tw / 16))?;
+            let frame_count = pipeline::frames_for_latent(zv.dim(2)?);
+            match (source, za) {
+                (Some((n, path)), _) => {
+                    // video in: decode, and carry the original soundtrack over untouched
+                    let mut eng = pipeline::Engine::new(paths.clone(), None, memc.clone(), dev.clone(), false);
+                    let frames = eng.decode_frames(&zv, n)?;
+                    let nf = frames.dim(0)?;
+                    let wave = if h3_rs::media::has_audio(&path) {
+                        let wv = h3_rs::media::load_audio(&path, 32000, Some(nf as f64 / pipeline::FPS as f64))?;
+                        Some(wv)
+                    } else {
+                        None
+                    };
+                    h3_rs::media::write_mp4(&output, &frames, pipeline::FPS as f64, wave.as_ref().map(|w| (w, 32000)), crf)?;
+                }
+                (None, Some(za)) => {
+                    if let Some(p) = &save_latents {
+                        pipeline::save_latents(p, &zv, &za)?;
+                    }
+                    pipeline::decode_and_write(&zv, &za, frame_count, &paths, &memc, &dev, &output, crf)?;
+                }
+                (None, None) => unreachable!(),
+            }
         }
         Cmd::Decode { latents, output, models, mem } => {
             let memc = mem.resolve()?;

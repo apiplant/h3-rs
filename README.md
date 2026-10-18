@@ -11,6 +11,7 @@ files as-is:
 | `vae/minimax_h3_video_vae_fp16.safetensors` (or the int8_convrot variant) | fp16 | `vae_video.rs` |
 | `vae/minimax_h3_audio_vae_fp32.safetensors` | fp32 | `vae_audio.rs` |
 | `loras/*.safetensors` (optional) | ComfyUI LoRA, incl. PDD head-bank `reshape_weight` | `lora.rs` |
+| `latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors` (optional) | fp16 3D-conv latent upscaler ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler), MIT) | `upscaler.rs` |
 
 Quantized weights stay quantized in memory and are dequantized per layer by NVRTC kernels (`kernels.rs`).
 
@@ -62,7 +63,7 @@ ln -s /path/to/ComfyUI/models ~/.cache/h3-rs/models
 ```
 
 Only the files in the table at the top are read (`diffusion_models/`, `text_encoders/`, `vae/`, and optionally
-`loras/`), so a full ComfyUI `models/` folder works as is.
+`loras/` and `latent_upscale_models/`), so a full ComfyUI `models/` folder works as is.
 
 ## Build
 
@@ -92,9 +93,18 @@ h3 generate -p "<Picture 1> walks through the scene of <Video 1>, speaking with 
 h3 generate -p "..." --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
 h3 generate -p "..." --ref-image a.png --lora minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors --steps 4
 
+# hi-res for less than sampling it all large: the first half of the steps run at the requested size, the latent is
+# upscaled (no VAE round trip), and the rest refines it at N times that size, which is the output size. --upscale
+# is the factor (1 < N <= 4), --upscale-split the share of steps at the requested size (default 0.5). Needs the
+# latent upscaler (see Models); --upscaler picks another checkpoint.
+h3 generate -p "..." --width 1376 --height 768 --upscale 2     # -> 2752x1536
+
 # re-decode saved latents
 h3 generate -p "..." --save-latents run.safetensors
 h3 decode run.safetensors -o run.mp4
+
+# raw learned upscale of saved latents, decoded at the new size (no refining pass)
+h3 upscale run.safetensors -o run_1.5x.mp4                  # --scale 2, or --width 2048 [--height ...]; also takes a video file
 ```
 
 Models resolve under `--models-dir` (env `H3_MODELS_DIR`; default `./models` or `~/ComfyUI/models` if present, else `~/.cache/h3-rs/models`). Override
@@ -119,7 +129,7 @@ curl -o out.mp4 -H 'content-type: application/json' localhost:8188/v1/generate \
 `POST /v1/generate` takes JSON: `prompt` (required), `width`, `height`, `megapixels`, `aspect`, `seconds` or
 `length`, `steps`, `seed`, `sampler`, `shift_video`, `shift_audio`, `image` / `last_image` (base64, `data:` URLs
 accepted), `fit`, `ref_images` / `ref_videos` / `ref_audios` (base64 lists), `ref_video_mute`, `ref_image_size`,
-`lora` (file name in `models/loras`, `"none"` to disable the server default), `lora_strength`, `crf`. It returns
+`lora` (file name in `models/loras`, `"none"` to disable the server default), `lora_strength`, `upscale` (factor, as `--upscale`) with `upscale_split`, `crf`. It returns
 `video/mp4`. `GET /` is a web studio (text / keyframes / references, live progress, takes; source in `ui/`, embedded in the binary),
 `GET /v1/info` lists models, memory settings, available LoRAs and queue length, `GET /v1/status` reports the stage and
 step of the running request, `GET /openapi.json` and `GET /docs` describe the API, `GET /health` returns `ok`. A warm 8-step 640×352 request takes about 12 s end to end.

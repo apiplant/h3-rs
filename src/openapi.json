@@ -92,6 +92,8 @@
           "ref_image_size": { "type": "string", "enum": ["match", "max"], "default": "match", "description": "`max` keeps references at a 2048 px short edge: best identity fidelity, slower." },
           "lora": { "type": "string", "description": "LoRA file name from `GET /v1/info`; `\"none\"` disables the server's default LoRA." },
           "lora_strength": { "type": "number", "default": 1.0 },
+          "upscale": { "type": "number", "minimum": 1, "maximum": 4, "description": "Sample at the requested size, upscale the latent N times with the MiniMax H3 latent upscaler, and finish the remaining steps at that larger size, which is the size of the returned video (cheaper than sampling everything at N times the size). 0 or 1 turns it off. Needs the upscaler model (`upscaler` in `GET /v1/info` is null without it), otherwise the request fails." },
+          "upscale_split": { "type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1, "default": 0.5, "description": "With `upscale`: fraction of the steps sampled at the low resolution." },
           "crf": { "type": "integer", "default": 18, "description": "H.264 quality, lower is better." }
         }
       },
@@ -106,6 +108,7 @@
           "audio_vae": { "type": "string" },
           "default_steps": { "type": "integer" },
           "default_lora": { "type": ["string", "null"] },
+          "upscaler": { "type": ["string", "null"], "description": "The latent upscaler checkpoint, when installed (needed by `upscale`)." },
           "loras": { "type": "array", "items": { "type": "string" }, "description": "LoRA files the server can load." },
           "memory": { "type": "object", "description": "The memory configuration in effect." },
           "queued": { "type": "integer", "description": "Requests waiting or running." }
@@ -116,7 +119,7 @@
         "properties": {
           "state": { "type": "string", "enum": ["idle", "starting", "running"] },
           "queued": { "type": "integer", "description": "Requests waiting or running." },
-          "stage": { "type": "string", "enum": ["idle", "encoding", "sampling", "decoding", "muxing"] },
+          "stage": { "type": "string", "enum": ["idle", "encoding", "sampling", "upscaling", "decoding", "muxing"] },
           "done": { "type": "integer" },
           "total": { "type": "integer" }
         }

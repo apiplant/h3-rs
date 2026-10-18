@@ -61,6 +61,12 @@ interface Saved {
   fit: "" | "stretch" | "crop";
   refSize: "match" | "max";
   mute: boolean;
+  custom: boolean;
+  cw: number;
+  ch: number;
+  upscale: boolean;
+  factor: number;
+  split: number;
 }
 
 function loadSaved(): Partial<Saved> {
@@ -125,9 +131,64 @@ function Drop(props: { accept: string; multiple?: boolean; onFiles: (f: File[]) 
   );
 }
 
+/** The attached file shown in the preview overlay, if any. */
+const [preview, setPreview] = createSignal<{ p: Picked; kind: "image" | "video" | "audio" } | null>(null);
+
+/** Full-size view of an attached image, a player for an attached video or audio file. Click outside or Esc closes it. */
+function Preview() {
+  return (
+    <Show when={preview()}>
+      {(v) => (
+        <div
+          class="fixed inset-0 z-50 grid place-items-center bg-ink-950/90 p-6 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Preview of ${v().p.name}`}
+          onClick={() => setPreview(null)}
+        >
+          <button class={`${btn} ${btnIcon} absolute top-4 right-4`} aria-label="Close preview" onClick={() => setPreview(null)}>
+            <Icon name="x" size={16} />
+          </button>
+          <div class="flex max-h-full max-w-full flex-col items-center gap-3" onClick={(e) => e.stopPropagation()}>
+            <Show when={v().kind === "image"}>
+              <img src={v().p.url} alt={v().p.name} class="max-h-[85vh] max-w-full rounded-lg object-contain" />
+            </Show>
+            <Show when={v().kind === "video"}>
+              <video src={v().p.url} controls autoplay playsinline class="max-h-[85vh] max-w-full rounded-lg" />
+            </Show>
+            <Show when={v().kind === "audio"}>
+              <div class="flex flex-col items-center gap-4 rounded-xl border border-ink-700 bg-ink-850 p-8">
+                <span class="text-aud">
+                  <Icon name="music" size={40} />
+                </span>
+                <audio src={v().p.url} controls autoplay class="w-80 max-w-full" />
+              </div>
+            </Show>
+            <p class="font-mono text-xs text-ink-400">
+              {v().p.name}
+              {v().p.w && v().p.h ? ` · ${v().p.w}×${v().p.h}` : ""}
+              {v().p.seconds && v().kind !== "image" ? ` · ${fmtTime(v().p.seconds!)}` : ""}
+            </p>
+          </div>
+        </div>
+      )}
+    </Show>
+  );
+}
+
 function Thumb(props: { p: Picked; kind: "image" | "video" | "audio"; tag?: string; onTag?: () => void; onRemove: () => void; class?: string }) {
   return (
-    <div class={`group relative overflow-hidden rounded-lg border border-ink-700 bg-ink-850 ${props.class ?? ""}`}>
+    <div
+      role="button"
+      tabindex="0"
+      title={`Preview ${props.p.name}`}
+      class={`group relative cursor-zoom-in overflow-hidden rounded-lg border border-ink-700 bg-ink-850 ${props.class ?? ""}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        setPreview({ p: props.p, kind: props.kind });
+      }}
+      onKeyDown={(e) => e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setPreview({ p: props.p, kind: props.kind }))}
+    >
       <Show when={props.kind === "image"}>
         <img src={props.p.url} alt={props.p.name} class="size-full object-cover" />
       </Show>
@@ -157,7 +218,10 @@ function Thumb(props: { p: Picked; kind: "image" | "video" | "audio"; tag?: stri
           <button
             class="absolute inset-x-1 bottom-1 cursor-pointer truncate rounded bg-ink-950/85 px-1 py-px text-left font-mono text-[10px] text-ink-100 hover:bg-accent hover:text-ink-950"
             title="Insert this tag into the prompt"
-            onClick={props.onTag}
+            onClick={(e) => {
+              e.stopPropagation();
+              props.onTag!();
+            }}
           >
             {props.tag}
           </button>
@@ -190,6 +254,12 @@ export function App() {
   const [fit, setFit] = createSignal<Saved["fit"]>(saved.fit ?? "");
   const [refSize, setRefSize] = createSignal<Saved["refSize"]>(saved.refSize ?? "match");
   const [mute, setMute] = createSignal(saved.mute ?? false);
+  const [custom, setCustom] = createSignal(saved.custom ?? false);
+  const [cw, setCw] = createSignal(saved.cw ?? 1280);
+  const [ch, setCh] = createSignal(saved.ch ?? 704);
+  const [upscale, setUpscale] = createSignal(saved.upscale ?? false);
+  const [factor, setFactor] = createSignal(saved.factor ?? 1.5);
+  const [split, setSplit] = createSignal(saved.split ?? 0.5);
   const [advanced, setAdvanced] = createSignal(false);
 
   const [first, setFirst] = createSignal<Picked | null>(null);
@@ -221,14 +291,22 @@ export function App() {
     const a = ASPECTS.find((x) => x[0] === aspect()) ?? ASPECTS[0];
     return [a[1], a[2]];
   });
-  const size = createMemo(() => canvas(ratio()[0], ratio()[1], mp()));
+  // a manual size snaps to the model's 32 px grid, like the engine does
+  const snap = (v: number) => Math.max(32, Math.round((Number.isFinite(v) ? v : 0) / 32) * 32);
+  const size = createMemo<[number, number]>(() => (custom() ? [snap(cw()), snap(ch())] : canvas(ratio()[0], ratio()[1], mp())));
+  const canUpscale = () => !!info()?.upscaler;
+  const upscaling = () => upscale() && canUpscale();
+  /** The delivered canvas: the selected one, times the factor when the upscaler is on (the engine rounds to 32). */
+  const outSize = createMemo<[number, number]>(() =>
+    upscaling() ? [Math.round((size()[0] * factor()) / 32) * 32, Math.round((size()[1] * factor()) / 32) * 32] : size(),
+  );
   const nFrames = createMemo(() => frames(seconds()));
-  const spec = createMemo(() => `${size()[0]}×${size()[1]} · ${nFrames()} frames · ${(nFrames() / FPS).toFixed(1)} s`);
+  const spec = createMemo(() => `${outSize()[0]}×${outSize()[1]} · ${nFrames()} frames · ${(nFrames() / FPS).toFixed(1)} s`);
 
   const refreshInfo = () => fetchInfo().then(setInfo).catch(() => {});
 
   createEffect(
-    () => JSON.stringify({ mode: mode(), prompt: prompt(), aspect: aspect(), mp: mp(), seconds: seconds(), steps: steps(), seed: seed(), lora: lora(), loraStrength: loraStrength(), sampler: sampler(), shiftV: shiftV(), shiftA: shiftA(), crf: crf(), fit: fit(), refSize: refSize(), mute: mute() }),
+    () => JSON.stringify({ mode: mode(), prompt: prompt(), aspect: aspect(), mp: mp(), seconds: seconds(), steps: steps(), seed: seed(), lora: lora(), loraStrength: loraStrength(), sampler: sampler(), shiftV: shiftV(), shiftA: shiftA(), crf: crf(), fit: fit(), refSize: refSize(), mute: mute(), custom: custom(), cw: cw(), ch: ch(), upscale: upscale(), factor: factor(), split: split() }),
     (json) => {
       try {
         localStorage.setItem(STORE, json);
@@ -244,6 +322,7 @@ export function App() {
         .catch(() => setOnline(false));
     const timer = setInterval(ping, 8000);
     const key = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && preview()) setPreview(null);
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
         if (!busy()) run();
@@ -297,6 +376,10 @@ export function App() {
       shift_audio: shiftA(),
       crf: crf(),
     };
+    if (upscaling()) {
+      req.upscale = factor();
+      req.upscale_split = split();
+    }
     if (steps().trim() !== "") req.steps = Math.max(1, Math.floor(Number(steps())));
     if (lora()) {
       req.lora = lora();
@@ -315,7 +398,10 @@ export function App() {
       req.ref_video_mute = mute();
       req.ref_image_size = refSize();
     }
-    if (m !== "frames" || !(first() || last())) req.aspect = aspect();
+    if (custom()) {
+      req.width = size()[0];
+      req.height = size()[1];
+    } else if (m !== "frames" || !(first() || last())) req.aspect = aspect();
     return { req, seed: sd };
   }
 
@@ -378,7 +464,8 @@ export function App() {
     if (current() === id) setCurrent(rest[0]?.id ?? null);
   }
 
-  const stageIndex = () => STAGES.findIndex((s) => s.id === st()?.stage);
+  // the upscaler runs between the two sampling passes: still "denoising" as far as the step list goes
+  const stageIndex = () => STAGES.findIndex((s) => s.id === (st()?.stage === "upscaling" ? "sampling" : st()?.stage));
   const sampling = () => (st()?.stage === "sampling" ? st()! : null);
   const eta = () => {
     const s = sampling();
@@ -641,7 +728,7 @@ export function App() {
                   <div class="w-full max-w-md">
                     <div class="mb-1 flex items-baseline justify-between">
                       <span class="text-sm font-medium text-ink-100">
-                        {st()?.state === "starting" && (st()?.queued ?? 0) > 1 ? `Waiting for ${st()!.queued - 1} ahead of you…` : (STAGES[stageIndex()]?.label ?? "Starting")}
+                        {st()?.state === "starting" && (st()?.queued ?? 0) > 1 ? `Waiting for ${st()!.queued - 1} ahead of you…` : (st()?.stage === "upscaling" ? "Upscaling the latent" : (STAGES[stageIndex()]?.label ?? "Starting"))}
                         …
                       </span>
                       <span class="font-mono text-xs text-ink-400">{elapsed().toFixed(1)} s</span>
@@ -763,7 +850,7 @@ export function App() {
                     <button
                       class="flex h-9 cursor-pointer items-center justify-center gap-2 rounded-lg border border-ink-700 bg-ink-850 text-xs text-ink-300 transition-colors hover:border-ink-500 aria-pressed:border-accent/60 aria-pressed:bg-accent/10 aria-pressed:text-ink-100 disabled:opacity-40"
                       aria-pressed={aspect() === name ? "true" : "false"}
-                      disabled={mode() === "frames" && !!(first() || last())}
+                      disabled={custom() || (mode() === "frames" && !!(first() || last()))}
                       onClick={() => setAspect(name)}
                     >
                       <Ratio w={w} h={h} on={aspect() === name} /> {name}
@@ -771,9 +858,19 @@ export function App() {
                   )}
                 </For>
               </div>
-              <div class="mt-2.5">
-                <Segmented value={mp()} onChange={setMp} options={QUALITY} />
-              </div>
+              <Show when={!custom()}>
+                <div class="mt-2.5">
+                  <Segmented value={mp()} onChange={setMp} options={QUALITY} />
+                </div>
+              </Show>
+              <Toggle label="Custom size" hint="Set the width and height yourself (snapped to multiples of 32)." checked={custom()} onChange={(v) => { if (v) { setCw(size()[0]); setCh(size()[1]); } setCustom(v); }} />
+              <Show when={custom()}>
+                <div class="flex items-center gap-2">
+                  <input class={`${input} text-right font-mono`} type="number" min="64" max="4096" step="32" aria-label="Width in pixels" value={cw()} onInput={(e) => setCw(Number(e.currentTarget.value))} onChange={() => setCw(snap(cw()))} />
+                  <span class="text-ink-500">×</span>
+                  <input class={`${input} text-right font-mono`} type="number" min="64" max="4096" step="32" aria-label="Height in pixels" value={ch()} onInput={(e) => setCh(Number(e.currentTarget.value))} onChange={() => setCh(snap(ch()))} />
+                </div>
+              </Show>
               <p class="mt-1.5 font-mono text-xs text-ink-400">
                 {size()[0]} × {size()[1]} px
               </p>
@@ -809,6 +906,25 @@ export function App() {
                 </span>
               </label>
             </div>
+
+            <Show when={canUpscale()}>
+              <div>
+                <div class={sectionLabel}>Latent upscale</div>
+                <Toggle
+                  label="Sample small, upscale, refine"
+                  hint="The first steps run at the selected size, the learned latent upscaler enlarges the result, and the rest of the steps finish it at the larger size."
+                  checked={upscale()}
+                  onChange={setUpscale}
+                />
+                <Show when={upscale()}>
+                  <Slider label="Factor" value={factor()} min={1.25} max={4} step={0.25} digits={2} unit="×" onChange={setFactor} />
+                  <Slider label="Steps at selected size" value={split()} min={0.25} max={0.75} step={0.05} digits={2} onChange={setSplit} />
+                  <p class="mt-1 font-mono text-xs text-ink-400">
+                    sampled at {size()[0]} × {size()[1]}, delivered at {outSize()[0]} × {outSize()[1]} px
+                  </p>
+                </Show>
+              </div>
+            </Show>
 
             <div>
               <div class={sectionLabel}>LoRA</div>
@@ -873,6 +989,10 @@ export function App() {
                       setCrf(18);
                       setRefSize("match");
                       setMute(false);
+                      setCustom(false);
+                      setUpscale(false);
+                      setFactor(1.5);
+                      setSplit(0.5);
                     }}
                   >
                     Reset to defaults
@@ -883,6 +1003,7 @@ export function App() {
           </div>
         </aside>
       </div>
+      <Preview />
     </div>
   );
 }
