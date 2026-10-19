@@ -375,6 +375,7 @@ impl TextEncoder {
             prefetch(l);
         }
         for (i, l) in self.layers.iter().enumerate() {
+            crate::progress::check()?;
             if let Some(next) = self.layers.get(i + 1) {
                 prefetch(next);
             }
@@ -450,6 +451,7 @@ impl TextEncoder {
         let mut x = x;
         let mut ds = vec![];
         for (li, b) in v.blocks.iter().enumerate() {
+            crate::progress::check()?;
             let hn = ops::layer_norm(&x, Some(&b.n1.0), Some(&b.n1.1), 1e-6)?;
             let qkv = b.qkv.forward(&hn)?;
             let q = kernels::qk_norm_rope(&qkv, 0, heads, hd, None, Some(&rope), hd, self.dtype)?;

@@ -32,7 +32,7 @@ pub enum Sampler {
 
 /// Run the sampler over the packed (video, carried audio) latent. `on_step(i, n)` is called
 /// after each step.
-pub fn sample(dit: &Dit, run: &DitRun, xv: Tensor, xa: Tensor, sigmas: &[f64], sampler: Sampler, inpaint: Option<&Inpaint>, on_step: impl FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
+pub fn sample(dit: &Dit, run: &DitRun, xv: Tensor, xa: Tensor, sigmas: &[f64], sampler: Sampler, inpaint: Option<&Inpaint>, on_step: impl FnMut(usize, usize) -> Result<()>) -> Result<(Tensor, Tensor)> {
     let s = sample_denoised(dit, run, xv, xa, sigmas, sampler, inpaint, on_step)?;
     Ok((s.xv, s.xa))
 }
@@ -58,7 +58,7 @@ pub fn sample_denoised(
     sigmas: &[f64],
     sampler: Sampler,
     inpaint: Option<&Inpaint>,
-    mut on_step: impl FnMut(usize, usize),
+    mut on_step: impl FnMut(usize, usize) -> Result<()>,
 ) -> Result<Sampled> {
     let mut old: Option<(Tensor, Tensor)> = None;
     let mut old_sigma_down: Option<f64> = None;
@@ -106,7 +106,7 @@ pub fn sample_denoised(
         old = Some((dv.clone(), da.clone()));
         last = Some((dv, da));
         old_sigma_down = Some(s_next);
-        on_step(i + 1, n);
+        on_step(i + 1, n)?;
         crate::dit::prof::dump();
     }
     let (denoised_v, denoised_a) = last.ok_or_else(|| anyhow::anyhow!("sigma schedule needs at least 2 values"))?;

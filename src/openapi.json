@@ -42,6 +42,16 @@
         }
       }
     },
+    "/v1/cancel": {
+      "post": {
+        "summary": "Cancel the running render and everything queued",
+        "description": "Stops the engine at the next denoising step / decode chunk and drops queued jobs; their `/v1/generate` requests fail with `cancelled`. Requests sent afterwards are unaffected.",
+        "operationId": "cancel",
+        "responses": {
+          "200": { "description": "Cancellation requested." }
+        }
+      }
+    },
     "/v1/status": {
       "get": {
         "summary": "What the engine is doing right now",
@@ -129,7 +139,7 @@
         "properties": {
           "state": { "type": "string", "enum": ["idle", "starting", "running"] },
           "queued": { "type": "integer", "description": "Requests waiting or running." },
-          "stage": { "type": "string", "enum": ["idle", "encoding", "sampling", "upscaling", "decoding", "muxing"] },
+          "stage": { "type": "string", "enum": ["idle", "encoding", "sampling", "upscaling", "decoding", "muxing", "downloading"] },
           "done": { "type": "integer" },
           "total": { "type": "integer" }
         }

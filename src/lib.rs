@@ -16,6 +16,7 @@ pub mod backend;
 pub mod config;
 pub mod control;
 pub mod dit;
+pub mod download;
 pub mod inpaint;
 #[cfg(feature = "cuda")]
 pub mod kernels;

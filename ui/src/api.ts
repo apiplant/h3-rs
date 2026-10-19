@@ -58,7 +58,7 @@ export interface Info {
 export interface Status {
   state: "idle" | "starting" | "running";
   queued: number;
-  stage: "idle" | "encoding" | "sampling" | "upscaling" | "decoding" | "muxing";
+  stage: "idle" | "encoding" | "sampling" | "upscaling" | "decoding" | "muxing" | "downloading";
   done: number;
   total: number;
 }
@@ -70,6 +70,10 @@ async function check(r: Response): Promise<Response> {
 
 export async function info(): Promise<Info> {
   return (await check(await fetch("/v1/info"))).json();
+}
+
+export async function cancel(): Promise<void> {
+  await fetch("/v1/cancel", { method: "POST" }).catch(() => {});
 }
 
 export async function status(): Promise<Status> {

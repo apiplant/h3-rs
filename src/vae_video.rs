@@ -155,6 +155,7 @@ impl VideoVae {
             let clip = self.tiled_decode(dec, &z.narrow(2, t0, t1 - t0)?)?;
             log::info(&format!("VAE decode chunk {}/{num_chunks}", i + 1));
             crate::progress::count(crate::progress::Stage::Decoding, i + 1, num_chunks);
+            crate::progress::check()?;
             for j in 0..2 {
                 let f0 = j * chunk_dec;
                 let f1 = (f0 + chunk_dec).min(clip.f);
@@ -357,6 +358,7 @@ impl VideoVae {
         for (i, row) in rows.iter().enumerate() {
             let mut res = vec![];
             for (j, tile) in row.iter().enumerate() {
+                crate::progress::check()?;
                 let mut t = tile.clone();
                 if i > 0 {
                     t = blend_t(&rows[i - 1][j], &t, ly[i - 1], 3)?;

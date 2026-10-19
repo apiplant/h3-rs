@@ -111,6 +111,7 @@ struct GenRequest {
 
 struct Job {
     req: GenRequest,
+    gen: u64,
     done: oneshot::Sender<Result<Vec<u8>>>,
 }
 
@@ -188,9 +189,9 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
     let control = match g.controlnet.as_deref() {
         None | Some("") | Some("none") => None,
         Some(name) => {
-            let model = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { d.patches_dir.join(name) };
+            let model = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { crate::download::ensure(&d.patches_dir, name)? };
             if !model.is_file() {
-                anyhow::bail!("ControlNet {name} not found in {}", d.patches_dir.display());
+                anyhow::bail!("ControlNet {name} not found");
             }
             Some(ControlRequest {
                 model,
@@ -204,9 +205,9 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
     let lora = match g.lora.as_deref() {
         Some("") | Some("none") => None,
         Some(name) => {
-            let p = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { d.loras_dir.join(name) };
+            let p = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { crate::download::ensure(&d.loras_dir, name)? };
             if !p.is_file() {
-                anyhow::bail!("LoRA {name} not found in {}", d.loras_dir.display());
+                anyhow::bail!("LoRA {name} not found");
             }
             Some((p.display().to_string(), g.lora_strength.unwrap_or(1.0)))
         }
@@ -275,6 +276,12 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
 fn worker(mut eng: Engine, defaults: Defaults, jobs: std_mpsc::Receiver<Job>, pending: Arc<AtomicUsize>) {
     static N: AtomicUsize = AtomicUsize::new(0);
     for job in jobs {
+        if crate::progress::is_cancelled(job.gen) {
+            pending.fetch_sub(1, Ordering::Relaxed);
+            let _ = job.done.send(Err(anyhow!("cancelled")));
+            continue;
+        }
+        crate::progress::begin(job.gen);
         let dir = std::env::temp_dir().join(format!("h3-serve-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let _scratch = Scratch(dir.clone());
         let r = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| {
@@ -310,7 +317,7 @@ async fn generate(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, req: H
     }
     let (done, rx) = oneshot::channel();
     pending.fetch_add(1, Ordering::Relaxed);
-    if jobs.send(Job { req: g, done }).is_err() {
+    if jobs.send(Job { req: g, gen: crate::progress::generation(), done }).is_err() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
     }
     match rx.await {
@@ -380,7 +387,11 @@ fn list_loras(dir: &std::path::Path) -> Vec<String> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
+    // known models are listed too: asking for one downloads it
+    let sub = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    names.extend(crate::download::known(sub).map(String::from));
     names.sort();
+    names.dedup();
     names
 }
 
@@ -465,6 +476,10 @@ async fn serve(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, addr: Str
             .service(web::resource("/v1/status").route(web::get().to(move || {
                 let s = status_json(&p3);
                 async move { HttpResponse::Ok().header("cache-control", "no-store").json(&s) }
+            })))
+            .service(web::resource("/v1/cancel").route(web::post().to(async || {
+                crate::progress::cancel_all();
+                HttpResponse::Ok().content_type("text/plain; charset=utf-8").body("cancelled\n")
             })))
             .service(
                 web::resource("/v1/generate").route(web::post().to(move |req: HttpRequest, body: Bytes| generate(j1.clone(), p1.clone(), req, body))),

@@ -39,6 +39,7 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 toml = "0.8"
 ntex = { version = "4", features = ["tokio"], optional = true }
 tokio = { version = "1", features = ["sync"], optional = true }
+ureq = "2"
 
 [features]
 default = ["cuda", "flash-attn", "serve"]

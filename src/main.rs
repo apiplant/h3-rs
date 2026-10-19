@@ -339,7 +339,7 @@ fn main() -> Result<()> {
             };
             let lora = match lora {
                 Some(l) => {
-                    let p = if std::path::Path::new(&l).is_file() { l } else { models.models_dir.join("loras").join(&l).display().to_string() };
+                    let p = if std::path::Path::new(&l).is_file() { l } else { h3_rs::download::ensure(&models.models_dir.join("loras"), &l)?.display().to_string() };
                     Some((p, lora_strength))
                 }
                 None => None,
@@ -349,13 +349,17 @@ fn main() -> Result<()> {
                 .map(|g| pipeline::Guide::parse(g, pipeline::GuideKind::Visual))
                 .chain(guide_audio.iter().map(|g| pipeline::Guide::parse(g, pipeline::GuideKind::Audio)))
                 .collect();
-            let control = controlnet.map(|c| pipeline::ControlRequest {
-                model: if std::path::Path::new(&c).is_file() { c.into() } else { models.models_dir.join("model_patches").join(c) },
-                video: control_video,
-                strength: control_strength,
-                start: control_start,
-                end: control_end,
-            });
+            let control = controlnet
+                .map(|c| -> anyhow::Result<_> {
+                    Ok(pipeline::ControlRequest {
+                        model: if std::path::Path::new(&c).is_file() { c.into() } else { h3_rs::download::ensure(&models.models_dir.join("model_patches"), &c)? },
+                        video: control_video,
+                        strength: control_strength,
+                        start: control_start,
+                        end: control_end,
+                    })
+                })
+                .transpose()?;
             let length = seconds.map(|s| (s * pipeline::FPS as f64).round() as usize).unwrap_or(length);
             let req = Request {
                 prompt,
@@ -400,12 +404,14 @@ fn main() -> Result<()> {
             let dit = models.dit.clone().unwrap_or_else(|| "minimax_h3_fl2va_pruned_int8_convrot.safetensors".into());
             let paths = ModelPaths::resolve(&models.models_dir, &dit, &models.text_encoder, &models.video_vae, &models.audio_vae)?.with_upscaler(&models.models_dir, &models.upscaler, false)?;
             let ref_dit = models.models_dir.join("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
-            let ref_dit = ref_dit.is_file().then_some(ref_dit);
+            let ref_dit = Some(ref_dit); // fetched on the first request with references
             let loras_dir = models.models_dir.join("loras");
-            let lora = lora.map(|l| {
-                let p = if std::path::Path::new(&l).is_file() { l } else { loras_dir.join(&l).display().to_string() };
-                (p, lora_strength)
-            });
+            let lora = lora
+                .map(|l| -> anyhow::Result<_> {
+                    let p = if std::path::Path::new(&l).is_file() { l } else { h3_rs::download::ensure(&loras_dir, &l)?.display().to_string() };
+                    Ok((p, lora_strength))
+                })
+                .transpose()?;
             let info = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "dit": paths.dit, "ref_dit": ref_dit, "text_encoder": paths.text_encoder,

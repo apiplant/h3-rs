@@ -14,6 +14,8 @@ files as-is:
 | `model_patches/*.safetensors` (optional) | MiniMax H3 Fun ControlNet (int8 or dense blocks, v1 5 / v2 10 control blocks) | `control.rs` |
 | `latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors` (optional) | fp16 3D-conv latent upscaler ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler), MIT) | `upscaler.rs` |
 
+Missing files are downloaded automatically from Hugging Face (resumable, into `--models-dir`): the four required models at startup, everything else (reference DiT, LoRAs, ControlNets, the upscaler) the first time it's used. Set `H3_NO_DOWNLOAD=1` to disable, `HF_ENDPOINT` to use a mirror.
+
 Quantized weights stay quantized in memory. CUDA uses NVRTC kernels; Apple Silicon uses MLX int8 matrix multiplication and attention, with Candle Metal for the rest of the pipeline. NVFP4 text-encoder weights are decoded one layer at a time.
 
 ## Install

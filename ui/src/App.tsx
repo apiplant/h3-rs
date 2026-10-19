@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal, onSettled, untrack } from "solid-js";
 import type { JSX } from "@solidjs/web";
-import { generate, info as fetchInfo, status as fetchStatus, type GenerateRequest, type Info, type Status } from "./api";
+import { cancel as cancelRender, generate, info as fetchInfo, status as fetchStatus, type GenerateRequest, type Info, type Status } from "./api";
 import { FPS, canvas, dataUrl, fmtTime, frames, inspect, type Picked } from "./media";
 import {
   btn, btnGhost, btnIcon, btnLg, btnPrimary, btnSm, btnSmIcon, btnStop, chipBtn, dot, editorBack, editorInput, errorBox, input, kbd,
@@ -450,9 +450,16 @@ export function App() {
     const m = mode();
     let sampleT0 = 0;
     const tick = setInterval(() => setElapsed((performance.now() - t0) / 1000), 100);
+    let live = true;
+    // closing or reloading the tab mid-render loses the result: make the browser ask first
+    const leave = (e: BeforeUnloadEvent) => e.preventDefault();
+    window.addEventListener("beforeunload", leave);
     const poll = setInterval(() => {
       fetchStatus()
         .then((s) => {
+          if (!live) return;
+          // jobs ahead of ours (e.g. a render we stopped waiting on) own the engine: their progress isn't ours
+          if (s.queued > 1) s = { ...s, state: "starting", stage: "idle", done: 0, total: 0 };
           if (s.stage === "sampling" && s.done > 0) {
             sampleT0 ||= performance.now();
             const done = s.done;
@@ -482,6 +489,8 @@ export function App() {
     } finally {
       clearInterval(tick);
       clearInterval(poll);
+      live = false;
+      window.removeEventListener("beforeunload", leave);
       setBusy(false);
       setSt(null);
       abort = null;
@@ -863,8 +872,8 @@ export function App() {
                 </button>
               }
             >
-              <button class={`${btnStop} ${btnLg}`} onClick={() => abort?.abort()} title="Stops waiting; the GPU finishes the render it already started">
-                <Icon name="stop" size={13} /> Stop waiting · {elapsed().toFixed(0)}s
+              <button class={`${btnStop} ${btnLg}`} onClick={() => { abort?.abort(); cancelRender(); }} title="Cancels the render">
+                <Icon name="stop" size={13} /> Cancel · {elapsed().toFixed(0)}s
               </button>
             </Show>
           </div>
@@ -902,7 +911,7 @@ export function App() {
                   <div class="w-full max-w-md">
                     <div class="mb-1 flex items-baseline justify-between">
                       <span class="text-sm font-medium text-ink-100">
-                        {st()?.state === "starting" && (st()?.queued ?? 0) > 1 ? `Waiting for ${st()!.queued - 1} ahead of you…` : (st()?.stage === "upscaling" ? "Upscaling the latent" : (STAGES[stageIndex()]?.label ?? "Starting"))}
+                        {st()?.state === "starting" && (st()?.queued ?? 0) > 1 ? `Waiting for ${st()!.queued - 1} ahead of you…` : (st()?.stage === "downloading" ? "Downloading a model" : st()?.stage === "upscaling" ? "Upscaling the latent" : (STAGES[stageIndex()]?.label ?? "Starting"))}
                         …
                       </span>
                       <span class="font-mono text-xs text-ink-400">{elapsed().toFixed(1)} s</span>
@@ -921,7 +930,7 @@ export function App() {
                       </Show>
                     </div>
                     <div class="mt-1.5 flex justify-between font-mono text-[11px] text-ink-400">
-                      <span>{sampling() ? `step ${sampling()!.done} / ${sampling()!.total}` : st()?.stage === "decoding" && st()!.total ? `chunk ${st()!.done} / ${st()!.total}` : " "}</span>
+                      <span>{sampling() ? `step ${sampling()!.done} / ${sampling()!.total}` : st()?.stage === "downloading" && st()!.total ? `${st()!.done} / ${st()!.total} MB` : st()?.stage === "decoding" && st()!.total ? `chunk ${st()!.done} / ${st()!.total}` : " "}</span>
                       <span>{rate() > 0 ? `${rate().toFixed(2)} s/step${eta() > 0 ? ` · ~${Math.ceil(eta())} s left` : ""}` : " "}</span>
                     </div>
                     <ol class="mt-5 grid grid-cols-4 gap-1.5">

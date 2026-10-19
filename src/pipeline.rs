@@ -47,6 +47,8 @@ pub struct ModelPaths {
     pub audio_vae: PathBuf,
     /// Latent upscaler checkpoint (`models/latent_upscale_models/`), when one was found.
     pub upscaler: Option<PathBuf>,
+    /// Where missing known models get downloaded to (ComfyUI layout)
+    pub models_dir: PathBuf,
 }
 
 /// Latent upscaler looked up by default.
@@ -60,13 +62,9 @@ impl ModelPaths {
             if p.is_file() {
                 return Ok(p.to_path_buf());
             }
-            let c = models_dir.join(sub).join(n);
-            if c.is_file() {
-                return Ok(c);
-            }
-            bail!("model file {n} not found (looked in {})", models_dir.join(sub).display())
+            crate::download::ensure(&models_dir.join(sub), n)
         };
-        Ok(Self { dit: r("diffusion_models", dit)?, text_encoder: r("text_encoders", te)?, video_vae: r("vae", vvae)?, audio_vae: r("vae", avae)?, upscaler: None })
+        Ok(Self { dit: r("diffusion_models", dit)?, text_encoder: r("text_encoders", te)?, video_vae: r("vae", vvae)?, audio_vae: r("vae", avae)?, upscaler: None, models_dir: models_dir.to_path_buf() })
     }
 
     /// Look for the latent upscaler `name` (a path, or a file in `<models_dir>/latent_upscale_models/`).
@@ -79,7 +77,7 @@ impl ModelPaths {
         } else if in_dir.is_file() {
             Some(in_dir)
         } else if required {
-            bail!("latent upscaler {name} not found (looked in {}); see the README for where to get it", models_dir.join("latent_upscale_models").display())
+            Some(crate::download::ensure(&models_dir.join("latent_upscale_models"), name)?)
         } else {
             None
         };
@@ -490,6 +488,7 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
         None => (w, h),
     };
     let (frame_count, latent_t, audio_t) = temporal_shape(req.length);
+    progress::check()?;
     progress::stage(Stage::Encoding);
     log::info(&format!(
         "{fw}x{fh}{}, {frame_count} frames ({:.2} s) -> latent {latent_t}x{}x{}, audio {audio_t}",
@@ -806,11 +805,15 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     }
 
     // 3. sample (with an upscale: first part small, latent upscale, rest at the delivered size)
-    let dit_path = if ref_mode { self.ref_dit.clone().unwrap_or(self.paths.dit.clone()) } else { self.paths.dit.clone() };
-    let upscaler_path = self.paths.upscaler.clone();
-    if req.upscale.is_some() && upscaler_path.is_none() {
-        bail!("no latent upscaler model: put {DEFAULT_UPSCALER} in models/latent_upscale_models/ (or pass --upscaler)");
+    if ref_mode && !self.ref_dit.as_ref().is_some_and(|p| p.is_file()) {
+        let dir = self.paths.models_dir.join("diffusion_models");
+        self.ref_dit = Some(crate::download::ensure(&dir, "minimax_h3_ref2va_pruned_int8_convrot.safetensors")?);
     }
+    let dit_path = if ref_mode { self.ref_dit.clone().unwrap_or(self.paths.dit.clone()) } else { self.paths.dit.clone() };
+    if req.upscale.is_some() && self.paths.upscaler.is_none() {
+        self.paths.upscaler = Some(crate::download::ensure(&self.paths.models_dir.join("latent_upscale_models"), DEFAULT_UPSCALER)?);
+    }
+    let upscaler_path = self.paths.upscaler.clone();
     let dev_for_upscaler = self.dev.clone();
     let keep_models = self.keep;
     let offload = self.mem.offload;
@@ -885,10 +888,11 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     let t2 = Instant::now();
     let mut last = Instant::now();
     progress::count(Stage::Sampling, 0, req.steps);
-    let step_log = |done: usize, last: &mut Instant| {
+    let step_log = |done: usize, last: &mut Instant| -> Result<()> {
         progress::count(Stage::Sampling, done, req.steps);
         log::info(&format!("step {done}/{}  {:.3}s/it  ({})", req.steps, last.elapsed().as_secs_f64(), vram()));
         *last = Instant::now();
+        progress::check()
     };
     let first_pass = sampling::sample_denoised(&*dit, &run, xv, xa, &sigmas[..=split], req.sampler, inpaint.as_ref(), |i, _| step_log(i, &mut last))?;
     drop(inpaint);
@@ -989,6 +993,7 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
 /// Decode a video latent to `[F, 3, H, W]` frames in [0, 1] (at most `frame_count` of them).
 pub fn decode_frames(&mut self, zv: &Tensor, frame_count: usize) -> Result<Tensor> {
     let t = Instant::now();
+    progress::check()?;
     progress::stage(Stage::Decoding);
     let frames = self.video_vae()?.decode(zv)?;
     self.release("vvae");
@@ -1003,6 +1008,7 @@ pub fn decode_and_write(&mut self, zv: &Tensor, za: &Tensor, frame_count: usize,
     let frames = self.decode_frames(zv, frame_count)?;
     let nf = frames.dim(0)?;
     let t = Instant::now();
+    progress::check()?;
     progress::stage(Stage::Muxing);
     let avae = self.audio_vae()?;
     let sr = avae.sample_rate;
@@ -1047,6 +1053,7 @@ pub fn save_latents(path: &str, zv: &Tensor, za: &Tensor) -> Result<()> {
 /// checkpoint at `path`. The model is loaded for the call and dropped again, so it never competes with the DiT.
 pub fn upscale_video_latent(path: &Path, dev: &Device, zv: &Tensor, cells: (usize, usize)) -> Result<Tensor> {
     let t = Instant::now();
+    progress::check()?;
     progress::stage(Stage::Upscaling);
     let up = LatentUpscaler::load(path, dev)?;
     let from = (zv.dim(3)?, zv.dim(4)?);

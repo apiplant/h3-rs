@@ -1144,6 +1144,7 @@ impl Dit {
         let mut next = Some(fetch(&self.blocks[0])?);
         let mut prev_marker: Option<crate::weights::Marker> = None;
         for (bi, b) in self.blocks.iter().enumerate() {
+            crate::progress::check()?;
             let [r_qkv, r_out, r_fc1, r_fc2] = next.take().unwrap();
             x = self.run_block(b, [r_qkv, r_out, r_fc1, r_fc2], x, &cx)?;
             if let (Some((model, rc)), Some(ci)) = (ctrl, ctrl.and_then(|(m, _)| m.injection.iter().position(|&l| l == bi))) {

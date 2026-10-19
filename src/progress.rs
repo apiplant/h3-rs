@@ -3,7 +3,7 @@
 //!
 //! One request runs at a time (the engine is single-tenant), so a process-wide state is enough.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -19,6 +19,8 @@ pub enum Stage {
     Muxing = 4,
     /// Latent upscaler between the two sampling passes of an upscaled request
     Upscaling = 5,
+    /// Fetching a missing model file: `done` of `total` megabytes
+    Downloading = 6,
 }
 
 impl Stage {
@@ -30,6 +32,7 @@ impl Stage {
             Stage::Decoding => "decoding",
             Stage::Muxing => "muxing",
             Stage::Upscaling => "upscaling",
+            Stage::Downloading => "downloading",
         }
     }
 }
@@ -64,7 +67,41 @@ pub fn snapshot() -> (Stage, u32, u32) {
         3 => Stage::Decoding,
         4 => Stage::Muxing,
         5 => Stage::Upscaling,
+        6 => Stage::Downloading,
         _ => Stage::Idle,
     };
     (s, DONE.load(Relaxed), TOTAL.load(Relaxed))
+}
+
+// Cancellation: `cancel_all` bumps a generation; a job stamped with an older generation than the current
+// one is cancelled, either before it starts or at the next `check` while it runs.
+static GEN: AtomicU64 = AtomicU64::new(0);
+static RUN: AtomicU64 = AtomicU64::new(0);
+
+/// The generation to stamp a newly queued job with.
+pub fn generation() -> u64 {
+    GEN.load(Relaxed)
+}
+
+/// Cancel the running job and everything queued so far.
+pub fn cancel_all() {
+    GEN.fetch_add(1, Relaxed);
+}
+
+/// Whether a job stamped with `gen` has been cancelled.
+pub fn is_cancelled(gen: u64) -> bool {
+    GEN.load(Relaxed) != gen
+}
+
+/// Mark `gen` as the job now using the engine.
+pub fn begin(gen: u64) {
+    RUN.store(gen, Relaxed);
+}
+
+/// Bail out if the running job was cancelled. Called between steps / chunks / stages.
+pub fn check() -> anyhow::Result<()> {
+    if is_cancelled(RUN.load(Relaxed)) {
+        anyhow::bail!("cancelled");
+    }
+    Ok(())
 }
