@@ -30,7 +30,7 @@ fn report(name: &str, got: &Tensor, want: &Tensor) -> Result<()> {
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let dir = &args[1];
-    let dev = Device::new_cuda(0)?;
+    let dev = h3_rs::backend::new_device(0)?;
     h3_rs::kernels::keep_pool_memory(&dev);
     for check in &args[2..] {
         match check.as_str() {

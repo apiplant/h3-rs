@@ -1,6 +1,6 @@
 # h3-rs
 
-MiniMax H3 text/image → video **with stereo audio** in Rust (candle + CUDA). It is a port of ComfyUI's
+MiniMax H3 text/image → video **with stereo audio** in Rust (CUDA, or MLX + Metal on Apple Silicon). It is a port of ComfyUI's
 implementation (`comfy/ldm/minimax`, `comfy_extras/nodes_minimax_h3.py`) and loads the ComfyUI model
 files as-is:
 
@@ -14,11 +14,11 @@ files as-is:
 | `model_patches/*.safetensors` (optional) | MiniMax H3 Fun ControlNet (int8 or dense blocks, v1 5 / v2 10 control blocks) | `control.rs` |
 | `latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors` (optional) | fp16 3D-conv latent upscaler ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler), MIT) | `upscaler.rs` |
 
-Quantized weights stay quantized in memory and are dequantized per layer by NVRTC kernels (`kernels.rs`).
+Quantized weights stay quantized in memory. CUDA uses NVRTC kernels; Apple Silicon uses MLX int8 matrix multiplication and attention, with Candle Metal for the rest of the pipeline. NVFP4 text-encoder weights are decoded one layer at a time.
 
 ## Install
 
-Linux x86_64 only (the engine is CUDA): an NVIDIA GPU (Ampere or newer), a driver for CUDA 13, `ffmpeg`, and the ComfyUI MiniMax H3 model files. Release archives and the website live at [h3-rs.apiplant.com](https://h3-rs.apiplant.com); see [`packaging/`](packaging/README.md).
+Linux x86_64: an NVIDIA GPU (Ampere or newer) and a driver for CUDA 13. Apple Silicon: macOS 15 or newer and sufficient unified memory. Both require `ffmpeg` and the ComfyUI MiniMax H3 model files. Release archives and the website live at [h3-rs.apiplant.com](https://h3-rs.apiplant.com); see [`packaging/`](packaging/README.md).
 
 Homebrew:
 
@@ -72,8 +72,34 @@ Needs CUDA 13.x, ffmpeg, Rust 1.97 or newer. `.cargo/config.toml` pins `CUDARC_C
 
 ```sh
 (cd ui && pnpm install && pnpm build)   # the web UI that `h3 serve` embeds (skipped: `/` then says how to build it)
-cargo build --release                   # first build compiles flash-attn (~15 min); --no-default-features --features serve skips it
+cargo build --release                   # first build compiles flash-attn (~15 min); --no-default-features --features cuda,serve skips it
 ```
+
+## Apple Silicon (MLX)
+
+Build on an M-series Mac with Rust 1.97+, CMake, Xcode command-line tools and the Metal toolchain:
+
+```sh
+(cd ui && pnpm install && pnpm build) # embed the web studio
+cargo build --release --no-default-features --features mlx,serve
+H3_MODELS_DIR=~/ComfyUI/models target/release/h3 generate --preset auto -p "A fox in snow" -o fox.mp4
+```
+
+Select one backend: `cuda` (default, with optional `flash-attn`) or `mlx`. The same models, generation commands,
+LoRA, control, reference and decode paths are used. The MLX build never invokes nvcc or links CUDA.
+Published Apple Silicon archives include `mlx.metallib`; keep it beside `h3`. Homebrew installs it under
+`share/h3-rs`, which the runtime also searches. Source builds use the MLX build's library location.
+
+MLX and Candle Metal allocate from unified memory. `--preset auto` accounts for process Metal allocations;
+`--preset minimal` streams weights from mapped files on smaller Macs. Allow room for macOS, activations and
+the video/audio VAEs. `H3_UNIFIED_MEMORY_GB` optionally sets the placement/MLX budget in GiB (default 80% of
+physical memory); it does not change macOS GPU limits or cap Candle allocations. No system settings are changed.
+Start with short, low-resolution clips and increase only after measuring memory use.
+
+Int8 weights are packed losslessly into MLX affine format; ConvRot, AWQ and LoRA transformations are retained.
+Candle/MLX boundaries currently materialize activation buffers, so this is not zero-copy interoperability.
+The CUDA benchmarks below do not describe Mac performance. Full model output parity requires the checkpoints;
+`cargo test --no-default-features --features mlx,serve --lib` exercises quantization and attention on the GPU.
 
 ## Use
 

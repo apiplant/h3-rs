@@ -1,7 +1,7 @@
 # Packaging
 
-One package, `h3-rs`, carrying the `h3` binary. h3 is CUDA-only, so every package is Linux x86_64 and needs an NVIDIA
-GPU (Ampere or newer), a driver for CUDA 13, `ffmpeg`, and the ComfyUI MiniMax H3 model files. The `packages`,
+One package, `h3-rs`, carrying the `h3` binary. Linux x86_64 packages use CUDA 13 and require an NVIDIA
+GPU (Ampere or newer). Apple Silicon archives use MLX on macOS 15+. Both require `ffmpeg` and the ComfyUI MiniMax H3 model files. The `packages`,
 `homebrew`, `apt` and `pacman` jobs in [`.github/workflows/release.yml`](../.github/workflows/release.yml) substitute
 the `@VERSION@`, `@SHA_*@`, `@ARCH@` and `@ARCHIVE_PREFIX@` placeholders with the tag's version and the checksums of
 the archives that release just built, then publish the result. None of the definitions compiles the project: they
@@ -10,7 +10,7 @@ install the binary the build jobs already produced. The `crates-io` job publishe
 
 | File | Publishes to |
 | --- | --- |
-| `homebrew/h3-rs.rb` | `apiplant/homebrew-tap`, as `Formula/h3-rs.rb` (Linux x86_64) |
+| `homebrew/h3-rs.rb` | `apiplant/homebrew-tap`, as `Formula/h3-rs.rb` (Linux x86_64 and macOS arm64) |
 | `pacman/PKGBUILD` | the release itself, as a `.pkg.tar.zst` asset, and `apiplant/pacman` |
 | `debian/control` | the release itself, as a `.deb` asset, and `apiplant/apt` |
 | `apt/apt-ftparchive.conf` | `apiplant/apt`, served at `apt.apiplant.com` |
@@ -73,3 +73,15 @@ sudo apt update && sudo apt install h3-rs
 ```
 
 Then put the ComfyUI MiniMax H3 files in a `models/` folder and run `H3_MODELS_DIR=~/ComfyUI/models h3 serve`.
+
+## Apple Silicon archives
+
+The native `macos-15` job follows the `fluid-speech-rs` packaging convention: a target-named
+`h3-rs-vVERSION-aarch64-apple-darwin.tar.gz` with a matching `.sha256` file, CLI `--version` smoke test,
+and Homebrew `on_macos` / `on_arm` URL and checksum. It also runs the MLX library tests. Linux CUDA,
+Debian, Arch and repository publication retain their existing paths.
+
+MLX's native library is statically linked, but GPU execution also requires `mlx.metallib`. The job sets
+`MLX_RS_METAL_PATH` to a workspace directory and packages its generated `mlx.metallib` alongside `h3`.
+The runtime resolves the adjacent file before initializing Metal; the formula instead installs it under
+`share/h3-rs`. This avoids depending on the build runner's home directory after installation.

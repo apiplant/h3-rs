@@ -1,0 +1,42 @@
+name: check
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  apple-silicon:
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      MLX_RS_METAL_PATH: ${{ github.workspace }}/target/mlx-metal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: apple-silicon-mlx
+      - run: brew list cmake >/dev/null || brew install cmake
+      - run: cargo check --locked --no-default-features --features mlx,serve --all-targets
+      - run: cargo test --locked --no-default-features --features mlx,serve --lib
+  cuda:
+    runs-on: ubuntu-22.04
+    container: nvidia/cuda:13.0.2-devel-ubuntu22.04
+    env:
+      CUDA_PATH: /usr/local/cuda
+      CUDA_COMPUTE_CAP: "80"
+      CUDARC_13.0.2: "13000"
+      DRAMA_CUDA_ARCH: "sm_80"
+    steps:
+      - run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl build-essential pkg-config ca-certificates git
+      - uses: actions/checkout@v4
+      - run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cuda
+      - run: cargo check --locked --no-default-features --features cuda,serve --all-targets

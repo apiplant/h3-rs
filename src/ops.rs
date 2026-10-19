@@ -54,6 +54,8 @@ pub fn gelu_erf(x: &Tensor) -> Result<Tensor> {
 /// Scaled dot-product attention on `[B, S, H, D]` tensors (k/v may have fewer heads: GQA).
 /// Returns `[B, S, H, D]`.
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Tensor> {
+    #[cfg(feature = "mlx")]
+    if q.device().is_metal() { return crate::apple::attention(q, k, v, causal); }
     let d = q.dim(D::Minus1)?;
     let scale = 1.0 / (d as f32).sqrt();
     #[cfg(feature = "flash-attn")]

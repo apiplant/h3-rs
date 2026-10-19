@@ -173,7 +173,16 @@ pub enum Held {
 // candle's stream wait for these copies, so callers just enqueue the next layer's upload before
 // the current layer's kernels have finished.
 
-use candle_core::cuda_backend::cudarc::driver::{CudaStream, PinnedHostSlice};
+#[cfg(feature = "cuda")]
+use candle_core::cuda_backend::cudarc::driver::PinnedHostSlice;
+#[cfg(feature = "cuda")]
+pub use cuda_upload::upload_u8_async;
+#[cfg(feature = "cuda")]
+use cuda_upload::{pin_bytes, upload_from_file};
+#[cfg(feature = "cuda")]
+mod cuda_upload {
+use candle_core::cuda_backend::cudarc::driver::CudaStream;
+use super::*;
 use candle_core::cuda_backend::CudaStorage;
 
 fn copy_stream(dev: &candle_core::CudaDevice) -> Result<Arc<CudaStream>> {
@@ -216,7 +225,7 @@ pub fn upload_u8_async<S: candle_core::cuda_backend::cudarc::driver::HostSlice<u
 
 /// Disk -> pinned staging buffer (pread) -> GPU. The staging buffer is reused, so the copy is
 /// completed before returning; reads run at disk speed instead of page-fault speed.
-fn upload_from_file(file: &SafeFile, name: &str, shape: &[usize], dev: &Device) -> Result<Tensor> {
+pub(super) fn upload_from_file(file: &SafeFile, name: &str, shape: &[usize], dev: &Device) -> Result<Tensor> {
     static STAGING: std::sync::Mutex<Option<PinnedHostSlice<u8>>> = std::sync::Mutex::new(None);
     let Device::Cuda(cd) = dev else { bail!("needs a CUDA device") };
     let len = file.bytes(name)?.len();
@@ -252,12 +261,31 @@ fn upload_slice<S: candle_core::cuda_backend::cudarc::driver::HostSlice<u8> + ?S
     Ok(dst)
 }
 
-fn pin_bytes(bytes: &[u8], dev: &Device) -> Option<Arc<PinnedHostSlice<u8>>> {
+pub(super) fn pin_bytes(bytes: &[u8], dev: &Device) -> Option<Arc<PinnedHostSlice<u8>>> {
     let Device::Cuda(cd) = dev else { return None };
     let mut p = unsafe { cd.cuda_stream().context().alloc_pinned::<u8>(bytes.len()) }.ok()?;
     unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.as_mut_ptr().ok()?, bytes.len()) };
     Some(Arc::new(p))
 }
+
+}
+
+#[cfg(not(feature = "cuda"))]
+fn upload_from_file(file: &SafeFile, name: &str, _: &[usize], dev: &Device) -> Result<Tensor> { file.load(name, dev) }
+
+#[cfg(not(feature = "cuda"))]
+fn pin_bytes(_: &[u8], _: &Device) -> Option<Arc<PinnedHostSlice<u8>>> { None }
+
+#[cfg(not(feature = "cuda"))]
+#[derive(Clone)]
+pub struct PinnedHostSlice<T>(Vec<T>);
+#[cfg(not(feature = "cuda"))]
+impl<T> PinnedHostSlice<T> {
+    fn len(&self) -> usize { self.0.len() }
+    fn as_slice(&self) -> Result<&[T]> { Ok(&self.0) }
+}
+#[cfg(not(feature = "cuda"))]
+fn upload_u8_async(src: &PinnedHostSlice<u8>, shape: &[usize], dev: &Device) -> Result<Tensor> { Ok(Tensor::from_slice(&src.0, shape, dev)?) }
 
 impl Held {
     pub fn new(file: &Arc<SafeFile>, name: &str, place: Placement, dev: &Device) -> Result<Self> {
@@ -566,6 +594,10 @@ impl QLinear {
 
     /// `y = x @ W^T + b` (+ LoRA), processing at most `chunk` rows of `x` per GEMM.
     pub fn forward_chunked(&self, x: &Tensor, chunk: usize) -> Result<Tensor> {
+        #[cfg(feature = "mlx")]
+        if x.device().is_metal() && matches!(self.fmt, QFormat::Int8 { .. }) && self.in_features % 64 == 0 {
+            return self.forward_raw(x, &self.fetch(x.device())?, chunk);
+        }
         let w = self.dequant(x.device(), x.dtype())?;
         self.apply(x, &w, chunk)
     }
@@ -621,8 +653,12 @@ pub fn small(file: &SafeFile, name: &str, dev: &Device, dtype: DType) -> Result<
 }
 
 /// A point on the compute stream the host can wait for (bounds how far uploads run ahead).
+#[cfg(feature = "cuda")]
 pub struct Marker(Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>);
+#[cfg(not(feature = "cuda"))]
+pub struct Marker;
 
+#[cfg(feature = "cuda")]
 impl Marker {
     pub fn record(dev: &Device) -> Self {
         match dev {
@@ -786,11 +822,17 @@ pub fn int8_enabled() -> bool {
 /// A weight ready for GEMMs: raw int8 (tensor-core path) or dequantized.
 pub enum Prepared {
     Int8(Raw),
+    #[cfg(feature = "mlx")]
+    Mlx(crate::apple::Int8Weight),
     Deq(Tensor),
 }
 
 impl QLinear {
     pub fn prepare(&self, raw: Raw, dev: &Device, dtype: DType) -> Result<Prepared> {
+        #[cfg(feature = "mlx")]
+        if matches!(self.fmt, QFormat::Int8 { .. }) && dev.is_metal() && self.in_features % 64 == 0 {
+            return Ok(Prepared::Mlx(crate::apple::Int8Weight::new(&raw.w, &self.scale.as_ref().unwrap().get(dev)?)?));
+        }
         Ok(match self.fmt {
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
             _ => Prepared::Deq(self.dequant_raw(&raw, dev, dtype)?),
@@ -807,6 +849,8 @@ impl QLinear {
         match p {
             Prepared::Deq(w) => self.apply(x, w, chunk),
             Prepared::Int8(raw) => self.apply_int8(x, raw, chunk),
+            #[cfg(feature = "mlx")]
+            Prepared::Mlx(w) => self.apply_mlx(x, w, chunk),
         }
     }
 
@@ -898,5 +942,42 @@ impl QLinear {
         let mut od = dims;
         *od.last_mut().unwrap() = self.out_features;
         Ok(y.reshape(od)?)
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+impl Marker {
+    pub fn record(_: &Device) -> Self { Self }
+    pub fn wait(&self) {}
+}
+
+#[cfg(feature = "mlx")]
+impl QLinear {
+    fn apply_mlx(&self, x: &Tensor, w: &crate::apple::Int8Weight, chunk: usize) -> Result<Tensor> {
+        let dims = x.dims().to_vec();
+        let k = self.in_features;
+        let rows = x.elem_count() / k;
+        let x2 = x.reshape((rows, k))?;
+        let x2 = match &self.pre_quant_scale {
+            Some(s) => x2.broadcast_mul(&s.to_dtype(x.dtype())?)?,
+            None => x2,
+        };
+        let mut outs = Vec::new();
+        for start in (0..rows).step_by(chunk.max(1)) {
+            let xc = x2.narrow(0, start, chunk.max(1).min(rows-start))?;
+            let xr = match self.fmt {
+                QFormat::Int8 { convrot: Some(g) } => rotate_activation(&xc, g)?,
+                _ => xc.clone(),
+            };
+            let mut y = w.forward(&xr)?;
+            if let Some(b) = &self.bias { y = y.broadcast_add(&b.to_dtype(y.dtype())?)?; }
+            for l in &self.loras {
+                let d = xc.matmul(&l.a.to_dtype(x.dtype())?.t()?)?.matmul(&l.b.to_dtype(x.dtype())?.t()?)?;
+                y = (y + (d * l.scale)?)?;
+            }
+            outs.push(y);
+        }
+        let mut shape = dims; *shape.last_mut().unwrap() = self.out_features;
+        Ok(Tensor::cat(&outs, 0)?.reshape(shape)?)
     }
 }

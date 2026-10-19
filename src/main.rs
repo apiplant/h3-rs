@@ -319,7 +319,7 @@ fn main() -> Result<()> {
             mem,
         } => {
             let memc = mem.resolve()?;
-            let dev = candle_core::Device::new_cuda(mem.device)?;
+            let dev = h3_rs::backend::new_device(mem.device)?;
             h3_rs::kernels::keep_pool_memory(&dev);
             let mut refs: Vec<pipeline::RefInput> = ref_image.into_iter().map(pipeline::RefInput::Image).collect();
             for v in ref_video {
@@ -417,7 +417,7 @@ fn main() -> Result<()> {
             let device = mem.device;
             h3_rs::serve::run(
                 move || {
-                    let dev = candle_core::Device::new_cuda(device)?;
+                    let dev = h3_rs::backend::new_device(device)?;
                     h3_rs::kernels::keep_pool_memory(&dev);
                     let mut eng = h3_rs::pipeline::Engine::new(paths, ref_dit, memc, dev, true);
                     eng.preload_with(lora.as_ref())?;
@@ -430,7 +430,7 @@ fn main() -> Result<()> {
         }
         Cmd::Upscale { input, scale, width, height, output, save_latents, crf, models, mem } => {
             let memc = mem.resolve()?;
-            let dev = candle_core::Device::new_cuda(mem.device)?;
+            let dev = h3_rs::backend::new_device(mem.device)?;
             h3_rs::kernels::keep_pool_memory(&dev);
             let paths = ModelPaths::resolve(&models.models_dir, models.dit.as_deref().unwrap_or("minimax_h3_fl2va_pruned_int8_convrot.safetensors"), &models.text_encoder, &models.video_vae, &models.audio_vae)?
                 .with_upscaler(&models.models_dir, &models.upscaler, true)?;
@@ -496,7 +496,7 @@ fn main() -> Result<()> {
         }
         Cmd::Decode { latents, output, models, mem } => {
             let memc = mem.resolve()?;
-            let dev = candle_core::Device::new_cuda(mem.device)?;
+            let dev = h3_rs::backend::new_device(mem.device)?;
             h3_rs::kernels::keep_pool_memory(&dev);
             let paths = ModelPaths::resolve(&models.models_dir, models.dit.as_deref().unwrap_or("minimax_h3_fl2va_pruned_int8_convrot.safetensors"), &models.text_encoder, &models.video_vae, &models.audio_vae)?;
             let (zv, za) = pipeline::load_latents(&latents, &dev)?;

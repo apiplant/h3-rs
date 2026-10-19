@@ -128,7 +128,12 @@ impl MemoryConfig {
 /// Free / total VRAM in bytes on the current CUDA context.
 pub fn vram_info() -> Result<(usize, usize)> {
     crate::kernels::trim_pool();
-    candle_core::cuda_backend::cudarc::driver::result::mem_get_info().map_err(|e| anyhow::anyhow!("mem_get_info: {e:?}"))
+    #[cfg(feature = "cuda")]
+    { candle_core::cuda_backend::cudarc::driver::result::mem_get_info().map_err(|e| anyhow::anyhow!("mem_get_info: {e:?}")) }
+    #[cfg(feature = "mlx")]
+    { crate::apple::memory_info() }
+    #[cfg(not(any(feature = "cuda", feature = "mlx")))]
+    { bail!("select the cuda or mlx backend") }
 }
 
 /// Resolve a "count of resident units" budget: explicit values clamp to `total`, `-1` fits as many

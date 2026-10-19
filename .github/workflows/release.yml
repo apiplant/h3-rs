@@ -4,7 +4,7 @@ name: release
 #
 #   git tag v0.x.0 && git push origin v0.x.0
 #
-# h3 is CUDA-only, so there is one platform: Linux x86_64. That builds the
+# Linux x86_64 retains CUDA; Apple Silicon uses MLX. This builds the
 # `h3` binary (in a CUDA 13 container, and again inside Arch against Arch's
 # own CUDA), attaches the archives, checksums and distro packages to the GitHub
 # release, and publishes the Homebrew formula, the apt and pacman repos and the
@@ -33,7 +33,7 @@ env:
   # kernels are built with NVRTC at run time for whatever GPU is present).
   CUDA_COMPUTE_CAP: "80"
   # no flash-attn: the engine has its own int8 attention, and flash-attn adds ~15 minutes
-  CARGO_FEATURES: "--no-default-features --features serve"
+  CARGO_FEATURES: "--no-default-features --features cuda,serve"
   # build.rs embeds ui/dist in the binary; fail rather than ship one without the web UI.
   H3_REQUIRE_UI: "1"
 
@@ -66,6 +66,53 @@ jobs:
         with:
           name: ui-dist
           path: ui/dist
+          if-no-files-found: error
+
+  # Apple Silicon packaging follows fluid-speech-rs: native build, smoke test,
+  # target-named tarball and SHA-256. MLX also needs its runtime Metal library.
+  binary-macos:
+    name: aarch64-apple-darwin (mlx)
+    needs: ui
+    runs-on: macos-15
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+      MLX_RS_METAL_PATH: ${{ github.workspace }}/target/mlx-metal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-apple-darwin-mlx
+      - name: Install build dependencies
+        run: brew list cmake >/dev/null || brew install cmake
+      - name: Build
+        run: cargo build --profile dist --locked --target aarch64-apple-darwin --no-default-features --features mlx,serve --bin h3
+      - name: Smoke test
+        run: |
+          target/aarch64-apple-darwin/dist/h3 --version
+          cargo test --profile dist --locked --target aarch64-apple-darwin --no-default-features --features mlx,serve --lib
+      - name: Package
+        shell: bash
+        run: |
+          name="h3-rs-${TAG}-aarch64-apple-darwin"
+          mkdir "$name"
+          cp target/aarch64-apple-darwin/dist/h3 README.md LICENSE "$name/"
+          test -s "$MLX_RS_METAL_PATH/mlx.metallib"
+          cp "$MLX_RS_METAL_PATH/mlx.metallib" "$name/"
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-aarch64-apple-darwin
+          path: |
+            h3-rs-*.tar.gz
+            h3-rs-*.tar.gz.sha256
           if-no-files-found: error
 
   # nvcc and the CUDA headers/libraries are needed at build time, not a GPU;
@@ -294,8 +341,8 @@ jobs:
 
   release:
     name: publish release
-    needs: [binary, binary-arch, packages]
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.packages.result == 'success' }}
+    needs: [binary, binary-macos, binary-arch, packages]
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.packages.result == 'success' && needs.binary-macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -324,7 +371,10 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            `h3` needs an NVIDIA GPU (Ampere or newer), a driver and the CUDA 13 runtime
+            Apple Silicon (macOS 15+): `h3-rs-${{ env.TAG }}-aarch64-apple-darwin.tar.gz`
+            uses MLX and unified memory. Keep `mlx.metallib` beside `h3` when unpacking.
+
+            The Linux `h3` build needs an NVIDIA GPU (Ampere or newer), a driver and the CUDA 13 runtime
             (libcudart, libcublas, libnvrtc, libcurand), `ffmpeg`, and the ComfyUI
             MiniMax H3 model files in a `models/` folder:
 
@@ -394,7 +444,7 @@ jobs:
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       CUDA_PATH: /usr/local/cuda
-      CARGO_FEATURES: "--no-default-features --features serve"
+      CARGO_FEATURES: "--no-default-features --features cuda,serve"
       CUDA_COMPUTE_CAP: "80"
       CUDARC_CUDA_VERSION: "13000"
     steps:
@@ -436,14 +486,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          name: binary-x86_64-unknown-linux-gnu
+          pattern: binary-*
+          merge-multiple: true
 
       - name: Render the formula
         if: env.TAP_TOKEN != ''
         run: |
           version="${GITHUB_REF_NAME#v}"
           sha=$(shasum -a 256 "dist/h3-rs-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)
-          sed -e "s/@VERSION@/$version/g" -e "s/@SHA_LINUX_X86_64@/$sha/" \
+          mac_sha=$(shasum -a 256 "dist/h3-rs-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)
+          sed -e "s/@VERSION@/$version/g" -e "s/@SHA_LINUX_X86_64@/$sha/" -e "s/@SHA_MACOS_ARM64@/$mac_sha/" \
             packaging/homebrew/h3-rs.rb > /tmp/h3-rs.rb
           if grep -qE '@[A-Z_]+@' /tmp/h3-rs.rb; then
             echo "::error::unsubstituted placeholder in the formula" >&2
