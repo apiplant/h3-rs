@@ -16,13 +16,14 @@ export const SITE = {
   pkg: "h3-rs",
   hasCuda: false,
   bins: ["h3"],
-  badges: ["Rust", "CUDA", "int8", "Apache-2.0"],
+  badges: ["Rust", "CUDA", "Apple Silicon", "int8", "Apache-2.0"],
   hero: { pre: "MiniMax H3 video with sound, ", accent: "on your GPU", post: "." },
   lead: "Text, keyframes or reference pictures in; a clip with stereo audio out, from one model and one binary. h3-rs loads the ComfyUI checkpoints as they are, keeps them quantized on the card, and renders as fast as ComfyUI. No Python at run time.",
   heroNote: "13.0 s per DiT step at 1344×768 × 124 frames on an RTX 4090, against 15.6 s in ComfyUI. The clip above was rendered by h3-rs.",
   demo: undefined as { href: string; label: string } | undefined,
   cargo: `cargo install h3-rs                          # needs the CUDA 13 toolkit (nvcc)
-CUDA_COMPUTE_CAP=86 cargo install h3-rs        # pick your GPU's compute capability`,
+CUDA_COMPUTE_CAP=86 cargo install h3-rs        # pick your GPU's compute capability
+cargo install h3-rs --no-default-features --features mlx,serve   # Apple Silicon (MLX)`,
   terminal: {
     title: "h3 serve",
     command: `h3 serve --preset minimal --steps 8`,

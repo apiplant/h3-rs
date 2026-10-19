@@ -7,8 +7,8 @@ export function DocsOverview() {
     <DocsLayout>
       <H1>Documentation</H1>
       <Lead>
-        h3-rs runs MiniMax's H3 video model, with its stereo soundtrack, on an NVIDIA GPU in Rust (candle plus hand-written
-        CUDA). It is a port of ComfyUI's implementation and loads the ComfyUI model files as they are. It ships as a library
+        h3-rs runs MiniMax's H3 video model, with its stereo soundtrack, on an NVIDIA GPU or Apple Silicon in Rust (candle plus hand-written
+        CUDA, or MLX and Metal). It is a port of ComfyUI's implementation and loads the ComfyUI model files as they are. It ships as a library
         crate and the <IC>h3</IC> command.
       </Lead>
 
@@ -51,8 +51,9 @@ export function DocsOverview() {
       <Section>
         <H2>Requirements</H2>
         <UL>
-          <LI>An NVIDIA GPU, Ampere or newer. 24 GB is comfortable; <IC>gb8</IC> renders full size in a 6.5 GB peak by streaming weights from disk (see <a class="text-accent hover:text-accent-dim" href="/docs/memory">memory presets</a>).</LI>
+          <LI>CUDA: an NVIDIA GPU, Ampere or newer. 24 GB is comfortable; <IC>gb8</IC> renders full size in a 6.5 GB peak by streaming weights from disk (see <a class="text-accent hover:text-accent-dim" href="/docs/memory">memory presets</a>).</LI>
           <LI>Linux x86_64 with a driver for CUDA 13, and <IC>ffmpeg</IC> on PATH (it reads reference media and writes the MP4).</LI>
+          <LI>Or an Apple Silicon Mac (MLX backend) with macOS 15 or newer and enough unified memory; <IC>ffmpeg</IC> is still required. <IC>--preset auto</IC> accounts for Metal allocations.</LI>
           <LI>16 to 48 GB of RAM depending on the preset.</LI>
         </UL>
         <CopyBlock command={`H3_MODELS_DIR=~/ComfyUI/models h3 generate -p "A red fox trots through fresh snow at dawn." -o fox.mp4`} />

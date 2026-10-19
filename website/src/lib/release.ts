@@ -2,7 +2,7 @@
  * The published release and its assets.
  *
  * `release.yml` builds one archive per target and names it
- * `h3-rs-<tag>-<target>.tar.gz` (Linux x86_64 only: the engine is CUDA), so a direct link
+ * `h3-rs-<tag>-<target>.tar.gz` (Linux x86_64 with CUDA, macOS arm64 with MLX), so a direct link
  * can be assembled here rather than sending every reader to the releases
  * page to hunt for their own. The version comes from the crate manifest at
  * build time, which means a site deployed from a commit predating the tag
@@ -28,9 +28,10 @@ export interface Platform {
   cuda?: boolean;
 }
 
-/* Exactly the target release.yml builds: h3 is CUDA-only. */
+/* Exactly the targets release.yml builds: CUDA on Linux, MLX on Apple Silicon. */
 export const PLATFORMS: Platform[] = [
   { target: "x86_64-unknown-linux-gnu", label: "Linux · x86_64 (CUDA)", short: "Linux x86_64, CUDA" },
+  { target: "aarch64-apple-darwin", label: "macOS · Apple Silicon (MLX)", short: "macOS arm64, MLX" },
 ];
 
 export function assetName(platform: Platform): string {

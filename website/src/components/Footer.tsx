@@ -59,7 +59,7 @@ export function Footer() {
             </span>
           </div>
           <p class="mt-3 max-w-xs text-sm leading-relaxed text-faint">
-            MiniMax H3 video with stereo audio on one GPU, in Rust and CUDA. Loads ComfyUI checkpoints. No Python at run time.
+            MiniMax H3 video with stereo audio on one GPU or Apple Silicon, in Rust with CUDA and MLX. Loads ComfyUI checkpoints. No Python at run time.
           </p>
         </div>
 

@@ -38,7 +38,7 @@ sudo apt update && sudo apt install ${pkg}`;
           </div>
           <h3 class="mt-3 text-base font-semibold tracking-tight text-ink">Use a package manager</h3>
           <p class="mt-2 text-sm leading-relaxed text-muted">
-            Arch Linux, Debian/Ubuntu and Homebrew on Linux, x86_64 with an NVIDIA GPU (Ampere or newer; 8 GB works, 24 GB is comfortable) with a CUDA 13 driver,
+            Arch Linux, Debian/Ubuntu and Homebrew on Linux (x86_64 with an NVIDIA GPU, Ampere or newer; 8 GB works, 24 GB is comfortable; CUDA 13 driver), and Homebrew on Apple Silicon (macOS 15+),
             published to the apiplant shared repositories. Then put the ComfyUI MiniMax H3 files in a <Mono>models/</Mono> folder (the layout is described in the docs) and set <Mono>H3_MODELS_DIR</Mono>. You also need <Mono>ffmpeg</Mono> on your PATH.
           </p>
           <Show when={cuda}>
@@ -135,7 +135,7 @@ sudo apt update && sudo apt install ${pkg}`;
           <span class="font-mono text-xs text-faint">03</span>
           <h3 class="mt-3 text-base font-semibold tracking-tight text-ink">Cargo</h3>
           <p class="mt-2 text-sm leading-relaxed text-muted">
-            Build from source. Needs the CUDA 13 toolkit (nvcc) and a recent Rust; set <Mono>CUDA_COMPUTE_CAP</Mono> if the build cannot ask nvidia-smi. The first build compiles flash-attn (about 15 minutes).
+            Build from source. Needs the CUDA 13 toolkit (nvcc) and a recent Rust; set <Mono>CUDA_COMPUTE_CAP</Mono> if the build cannot ask nvidia-smi. The first build compiles flash-attn (about 15 minutes). On Apple Silicon build with <Mono>--no-default-features --features mlx,serve</Mono> (needs CMake and the Metal toolchain).
           </p>
         </div>
 
