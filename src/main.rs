@@ -25,7 +25,11 @@ struct Models {
     /// ComfyUI `models` directory (model names below resolve against its subfolders).
     #[arg(long, default_value_os_t = default_models_dir(), env = "H3_MODELS_DIR")]
     models_dir: PathBuf,
-    /// DiT checkpoint (default: fl2va, or ref2va when references are given).
+    /// Model to run: h3, fasth3 or singularity (each lives in `diffusion_models/<name>/`, downloaded when missing;
+    /// see `h3 models`). `serve` asks when this is left out on a terminal.
+    #[arg(long, env = "H3_MODEL")]
+    model: Option<String>,
+    /// DiT checkpoint file or path; overrides --model (default: fl2va, or ref2va when references are given).
     #[arg(long)]
     dit: Option<String>,
     #[arg(long, default_value = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors")]
@@ -37,6 +41,16 @@ struct Models {
     /// Latent upscaler (models/latent_upscale_models) for `--upscale` and `h3 upscale`.
     #[arg(long, default_value = pipeline::DEFAULT_UPSCALER)]
     upscaler: String,
+}
+
+impl Models {
+    /// The chosen `--model`, if any and no explicit `--dit` overrides it.
+    fn variant(&self) -> Result<Option<&'static h3_rs::variants::Variant>> {
+        match (&self.model, &self.dit) {
+            (Some(m), None) => Ok(Some(h3_rs::variants::find(m)?)),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(clap::Args, Clone)]
@@ -131,8 +145,9 @@ enum Cmd {
         /// Duration in seconds (overrides --length).
         #[arg(long)]
         seconds: Option<f64>,
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
+        /// Sampling steps (default: the model's own, 20 unless --model says otherwise).
+        #[arg(long)]
+        steps: Option<usize>,
         #[arg(long, default_value_t = 1)]
         seed: u64,
         #[arg(long, value_enum, default_value = "res-multistep")]
@@ -247,9 +262,9 @@ enum Cmd {
         /// Address to listen on
         #[arg(long, default_value = "127.0.0.1:8188")]
         addr: String,
-        /// Default sampling steps for requests that leave it out
-        #[arg(long, default_value_t = 20)]
-        steps: usize,
+        /// Default sampling steps for requests that leave it out (default: the model's own)
+        #[arg(long)]
+        steps: Option<usize>,
         /// Default LoRA for requests that leave `lora` out (name in models/loras or a path)
         #[arg(long)]
         lora: Option<String>,
@@ -260,6 +275,19 @@ enum Cmd {
         #[command(flatten)]
         mem: Mem,
     },
+    /// List the models h3 can run and which are downloaded.
+    Models {
+        #[arg(long, default_value_os_t = default_models_dir(), env = "H3_MODELS_DIR")]
+        models_dir: PathBuf,
+    },
+    /// Download models (h3, fasth3, singularity) into `diffusion_models/<name>/` without running anything.
+    Download {
+        /// One or more of: h3, fasth3, singularity
+        #[arg(required = true)]
+        names: Vec<String>,
+        #[arg(long, default_value_os_t = default_models_dir(), env = "H3_MODELS_DIR")]
+        models_dir: PathBuf,
+    },
     /// Print the memory presets as TOML.
     Presets,
 }
@@ -267,6 +295,18 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Models { models_dir } => {
+            println!("models in {}\n", models_dir.display());
+            for l in h3_rs::variants::listing(&models_dir) {
+                println!("  {l}");
+            }
+            println!("\nrun one with `h3 serve --model <name>`; it is downloaded on first use (or `h3 download <name>`)");
+        }
+        Cmd::Download { names, models_dir } => {
+            for n in names {
+                h3_rs::variants::find(&n)?.ensure_all(&models_dir)?;
+            }
+        }
         Cmd::Presets => {
             for p in [Preset::Gb24, Preset::Gb16, Preset::Gb12, Preset::Gb8, Preset::Minimal, Preset::Auto] {
                 #[derive(serde::Serialize)]
@@ -328,7 +368,20 @@ fn main() -> Result<()> {
             }
             refs.extend(ref_audio.into_iter().map(pipeline::RefInput::Audio));
             let default_dit = if refs.is_empty() { "minimax_h3_fl2va_pruned_int8_convrot.safetensors" } else { "minimax_h3_ref2va_pruned_int8_convrot.safetensors" };
-            let paths = ModelPaths::resolve(&models.models_dir, models.dit.as_deref().unwrap_or(default_dit), &models.text_encoder, &models.video_vae, &models.audio_vae)?
+            let variant = models.variant()?;
+            let variant_dit = variant
+                .map(|v| -> Result<PathBuf> {
+                    if refs.is_empty() {
+                        return v.ensure_main(&models.models_dir);
+                    }
+                    let p = v.reference_path(&models.models_dir);
+                    h3_rs::variants::ensure_path(&p)?;
+                    Ok(p)
+                })
+                .transpose()?
+                .map(|p| p.display().to_string());
+            let steps = steps.or(variant.map(|v| v.steps)).unwrap_or(20);
+            let paths = ModelPaths::resolve(&models.models_dir, variant_dit.as_deref().or(models.dit.as_deref()).unwrap_or(default_dit), &models.text_encoder, &models.video_vae, &models.audio_vae)?
                 .with_upscaler(&models.models_dir, &models.upscaler, upscale.is_some())?;
             let aspect = match aspect {
                 Some(a) => {
@@ -392,7 +445,7 @@ fn main() -> Result<()> {
             };
             pipeline::generate(&req, &paths, &memc, &dev)?;
         }
-        Cmd::Serve { addr, steps, lora, lora_strength, models, mem } => {
+        Cmd::Serve { addr, steps, lora, lora_strength, mut models, mem } => {
             let mut memc = mem.resolve()?;
             // every model stays loaded: stream the text encoder and VAE decoder, give the DiT the rest
             if mem.te_gpu_layers.is_none() && mem.config.is_none() {
@@ -401,9 +454,22 @@ fn main() -> Result<()> {
             if mem.config.is_none() {
                 memc.vae_resident = false;
             }
-            let dit = models.dit.clone().unwrap_or_else(|| "minimax_h3_fl2va_pruned_int8_convrot.safetensors".into());
+            if models.model.is_none() && models.dit.is_none() {
+                if let Some(v) = h3_rs::variants::choose(&models.models_dir)? {
+                    models.model = Some(v.id.to_string());
+                }
+            }
+            let variant = models.variant()?;
+            let steps = steps.or(variant.map(|v| v.steps)).unwrap_or(20);
+            let dit = match variant {
+                Some(v) => v.ensure_main(&models.models_dir)?.display().to_string(),
+                None => models.dit.clone().unwrap_or_else(|| "minimax_h3_fl2va_pruned_int8_convrot.safetensors".into()),
+            };
             let paths = ModelPaths::resolve(&models.models_dir, &dit, &models.text_encoder, &models.video_vae, &models.audio_vae)?.with_upscaler(&models.models_dir, &models.upscaler, false)?;
-            let ref_dit = models.models_dir.join("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors");
+            let ref_dit = match variant {
+                Some(v) => v.reference_path(&models.models_dir),
+                None => models.models_dir.join("diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"),
+            };
             let ref_dit = Some(ref_dit); // fetched on the first request with references
             let loras_dir = models.models_dir.join("loras");
             let lora = lora
@@ -414,6 +480,7 @@ fn main() -> Result<()> {
                 .transpose()?;
             let info = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
+                "model": variant.map(|v| v.id),
                 "dit": paths.dit, "ref_dit": ref_dit, "text_encoder": paths.text_encoder,
                 "video_vae": paths.video_vae, "audio_vae": paths.audio_vae, "upscaler": paths.upscaler,
                 "default_steps": steps, "default_lora": lora.as_ref().map(|l| l.0.clone()),

@@ -69,6 +69,22 @@ pub fn ensure(dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Download `url` to `dest` (resumable, honours `H3_NO_DOWNLOAD` and `HF_ENDPOINT`) unless it is already there.
+pub fn ensure_url(dest: &Path, url: &str, approx_mb: u32) -> Result<()> {
+    if dest.is_file() {
+        return Ok(());
+    }
+    let name = dest.file_name().and_then(|s| s.to_str()).unwrap_or("model");
+    if std::env::var_os("H3_NO_DOWNLOAD").is_some_and(|v| v != "0" && !v.is_empty()) {
+        bail!("model file {} not found (downloads disabled by H3_NO_DOWNLOAD)", dest.display());
+    }
+    let url = url.replacen("https://huggingface.co", &endpoint(), 1);
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    fetch(&url, dest, approx_mb).with_context(|| format!("downloading {name}"))
+}
+
 fn endpoint() -> String {
     std::env::var("HF_ENDPOINT").ok().filter(|s| !s.is_empty()).map(|s| s.trim_end_matches('/').to_string()).unwrap_or_else(|| "https://huggingface.co".into())
 }

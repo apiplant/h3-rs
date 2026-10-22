@@ -34,6 +34,7 @@ pub mod sampling;
 pub mod serve;
 pub mod text;
 pub mod upscaler;
+pub mod variants;
 pub mod vae_audio;
 pub mod vae_video;
 pub mod weights;

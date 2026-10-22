@@ -806,8 +806,13 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
 
     // 3. sample (with an upscale: first part small, latent upscale, rest at the delivered size)
     if ref_mode && !self.ref_dit.as_ref().is_some_and(|p| p.is_file()) {
-        let dir = self.paths.models_dir.join("diffusion_models");
-        self.ref_dit = Some(crate::download::ensure(&dir, "minimax_h3_ref2va_pruned_int8_convrot.safetensors")?);
+        match &self.ref_dit {
+            Some(p) => crate::variants::ensure_path(p)?,
+            None => {
+                let dir = self.paths.models_dir.join("diffusion_models");
+                self.ref_dit = Some(crate::download::ensure(&dir, "minimax_h3_ref2va_pruned_int8_convrot.safetensors")?);
+            }
+        }
     }
     let dit_path = if ref_mode { self.ref_dit.clone().unwrap_or(self.paths.dit.clone()) } else { self.paths.dit.clone() };
     if req.upscale.is_some() && self.paths.upscaler.is_none() {

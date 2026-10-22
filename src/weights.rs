@@ -51,6 +51,8 @@ impl SafeFile {
             let shape = v["shape"].as_array().context("shape")?.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect();
             let offs = v["data_offsets"].as_array().context("offsets")?;
             let (start, end) = (offs[0].as_u64().unwrap_or(0) as usize, offs[1].as_u64().unwrap_or(0) as usize);
+            // some exports keep the ComfyUI checkpoint prefix on the diffusion model's tensors
+            let k = k.strip_prefix("model.diffusion_model.").map(str::to_string).unwrap_or(k);
             tensors.insert(k, TensorInfo { dtype, shape, start, end });
         }
         Ok(Arc::new(Self { path: path.display().to_string(), fh: file, mmap, data_start: 8 + n, tensors, metadata }))

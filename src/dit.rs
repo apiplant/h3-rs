@@ -266,6 +266,8 @@ pub struct DitConfig {
     pub head_dim: usize,
     pub ffn: usize,
     pub latents_dim: usize,
+    /// Stacked PDD output heads in the checkpoint itself (1 = plain heads; a LoRA can grow them later).
+    pub pdd_heads: usize,
     pub audio_dim: usize,
     pub text_dim: usize,
     pub time_embed_dim: usize,
@@ -292,15 +294,23 @@ impl DitConfig {
         } else {
             (f.shape("time_embedder.proj_out.weight")?[0], None, f.shape("time_embedder.proj_in.weight")?[1])
         };
+        // a native PDD checkpoint ships `pdd_steps` stacked output heads (block 0 full, the rest offsets)
+        let pdd_heads = f
+            .metadata
+            .get("config")
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|c| c["transformer"]["pdd_steps"].as_u64())
+            .map_or(1, |n| (n as usize).max(1));
         Ok(Self {
             hidden,
+            pdd_heads,
             layers: count("blocks.", "norm1.weight"),
             refiner_layers: count("token_refiner.blocks.", "norm1.weight"),
             heads: qkv / (3 * head_dim),
             head_dim,
             ffn: f.shape("blocks.0.mlp.fc1.weight")?[0] / 2,
-            latents_dim: f.shape("final_layer.video_out.weight")?[0] / 4,
-            audio_dim: f.shape("final_layer.audio_out.weight")?[0],
+            latents_dim: f.shape("final_layer.video_out.weight")?[0] / pdd_heads / 4,
+            audio_dim: f.shape("final_layer.audio_out.weight")?[0] / pdd_heads,
             text_dim: f.shape("condition_proj.weight")?[1],
             time_embed_dim,
             curve_grid,
@@ -569,7 +579,7 @@ impl Dit {
             final_adaln: dense_f32(&f, "final_layer.adaln_proj.linear", dev)?,
             video_out: dense_f32(&f, "final_layer.video_out", dev)?,
             audio_out: dense_f32(&f, "final_layer.audio_out", dev)?,
-            pdd_heads: 1,
+            pdd_heads: cfg.pdd_heads,
             control: None,
             capture_blocks: vec![],
             captured: Default::default(),
