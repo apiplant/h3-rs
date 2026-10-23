@@ -1,6 +1,6 @@
 import { For, Show, createEffect, createMemo, createSignal, onSettled, untrack } from "solid-js";
 import type { JSX } from "@solidjs/web";
-import { cancel as cancelRender, generate, info as fetchInfo, status as fetchStatus, type GenerateRequest, type Info, type Status } from "./api";
+import { cancel as cancelRender, deleteJob, generate, info as fetchInfo, status as fetchStatus, type GenerateRequest, type Info, type Status } from "./api";
 import { FPS, canvas, dataUrl, fmtTime, frames, inspect, type Picked } from "./media";
 import {
   btn, btnGhost, btnIcon, btnLg, btnPrimary, btnSm, btnSmIcon, btnStop, chipBtn, dot, editorBack, editorInput, errorBox, input, kbd,
@@ -19,6 +19,8 @@ interface Guide {
 
 interface Take {
   id: number;
+  /** The render's folder on the server (deleted with the take). */
+  job: string;
   url: string;
   prompt: string;
   seed: number;
@@ -472,7 +474,7 @@ export function App() {
     }, 450);
     try {
       const { req, seed: sd } = await request();
-      const blob = await generate(req, abort.signal);
+      const { blob, job } = await generate(req, abort.signal);
       const url = URL.createObjectURL(blob);
       const id = nextId++;
       const probe = document.createElement("video");
@@ -481,7 +483,7 @@ export function App() {
         probe.onerror = () => ok(nFrames() / FPS);
         probe.src = url;
       });
-      setTakes((t) => [{ id, url, prompt: req.prompt, seed: sd, spec: label, seconds: dur, took: (performance.now() - t0) / 1000, mode: m }, ...t]);
+      setTakes((t) => [{ id, job, url, prompt: req.prompt, seed: sd, spec: label, seconds: dur, took: (performance.now() - t0) / 1000, mode: m }, ...t]);
       setCurrent(id);
       refreshInfo();
     } catch (e: any) {
@@ -497,9 +499,18 @@ export function App() {
     }
   }
 
-  function removeTake(id: number) {
+  async function removeTake(id: number) {
     const t = takes().find((x) => x.id === id);
-    if (t) URL.revokeObjectURL(t.url);
+    if (!t || !confirm("Delete this take? Its files on the server are removed too.")) return;
+    if (t.job) {
+      try {
+        await deleteJob(t.job);
+      } catch (e: any) {
+        setError(`Could not delete the take: ${e.message}`);
+        return;
+      }
+    }
+    URL.revokeObjectURL(t.url);
     const rest = takes().filter((x) => x.id !== id);
     setTakes(rest);
     if (current() === id) setCurrent(rest[0]?.id ?? null);

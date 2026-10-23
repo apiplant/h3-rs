@@ -1,6 +1,6 @@
 [package]
 name = "h3-rs"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 # ntex 4 (the `serve` feature) needs 1.97
 rust-version = "1.97"

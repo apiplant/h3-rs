@@ -80,10 +80,42 @@ export async function status(): Promise<Status> {
   return (await check(await fetch("/v1/status", { cache: "no-store" }))).json();
 }
 
-/** POST /v1/generate; resolves when the video is finished. */
-export async function generate(req: GenerateRequest, signal?: AbortSignal): Promise<Blob> {
-  const r = await check(
-    await fetch("/v1/generate", { method: "POST", body: JSON.stringify(req), headers: { "content-type": "application/json" }, signal }),
-  );
-  return r.blob();
+/** DELETE /v1/jobs: the server keeps a finished render's folder until the user deletes the take. */
+export async function deleteJob(job: string): Promise<void> {
+  await check(await fetch(`/v1/jobs?id=${encodeURIComponent(job)}`, { method: "DELETE" }));
+}
+
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((ok, no) => {
+    const t = setTimeout(ok, ms);
+    signal?.addEventListener("abort", () => (clearTimeout(t), no(new DOMException("aborted", "AbortError"))), { once: true });
+  });
+
+/**
+ * Queue the request (POST /v1/jobs), poll the job until it is finished, then fetch the video. No single HTTP request
+ * stays open for the whole render, so a dropped connection while it runs costs nothing (`job`: its folder on the server).
+ */
+export async function generate(req: GenerateRequest, signal?: AbortSignal): Promise<{ blob: Blob; job: string }> {
+  const { id } = await (await check(await fetch("/v1/jobs", { method: "POST", body: JSON.stringify(req), headers: { "content-type": "application/json" }, signal }))).json();
+  for (;;) {
+    await sleep(1000, signal);
+    let s: { state: string; error?: string };
+    try {
+      s = await (await check(await fetch(`/v1/jobs?id=${encodeURIComponent(id)}`, { cache: "no-store", signal }))).json();
+    } catch (e: any) {
+      if (e.name === "AbortError") throw e;
+      continue; // server busy or briefly unreachable: keep waiting
+    }
+    if (s.state === "failed") throw new Error(s.error || "render failed");
+    if (s.state === "done") break;
+  }
+  for (let tries = 0; ; tries++) {
+    try {
+      const r = await check(await fetch(`/v1/jobs/result?id=${encodeURIComponent(id)}`, { signal }));
+      return { blob: await r.blob(), job: id };
+    } catch (e: any) {
+      if (e.name === "AbortError" || tries >= 5) throw e;
+      await sleep(1000, signal);
+    }
+  }
 }

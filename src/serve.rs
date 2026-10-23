@@ -18,10 +18,11 @@
 //! - `GET /`: a web UI for all of the above (built from `ui/` and embedded). `GET /openapi.json`: the API as
 //!   OpenAPI 3.1, and `GET /docs` renders it (Scalar, loaded from a CDN).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
 use ntex::http::StatusCode;
@@ -112,15 +113,53 @@ struct GenRequest {
 struct Job {
     req: GenRequest,
     gen: u64,
-    done: oneshot::Sender<Result<Vec<u8>>>,
+    /// Folder name in the temp dir (`h3-serve-<pid>-<n>`), also the id clients poll with.
+    name: String,
+    /// `POST /v1/generate` waits on the finished mp4 here; `POST /v1/jobs` clients poll instead.
+    done: Option<oneshot::Sender<Result<(Vec<u8>, String)>>>,
 }
 
-/// Per-request scratch directory, removed on drop.
-struct Scratch(PathBuf);
+/// `queued` / `running` / `done` / `failed: <why>` per job id, for `GET /v1/jobs`.
+fn states() -> &'static Mutex<HashMap<String, String>> {
+    static S: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+fn set_state(name: &str, state: impl Into<String>) {
+    states().lock().unwrap().insert(name.to_string(), state.into());
+}
+
+/// Per-request directory in the temp dir. A failed request's is removed on drop; a finished one is kept
+/// (`keep`) until the user deletes the take in the UI (`DELETE /v1/jobs`).
+struct Scratch(PathBuf, bool);
+impl Scratch {
+    fn keep(&mut self) {
+        self.1 = true;
+    }
+}
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.1 {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
+}
+
+/// A job folder name as the worker makes them: `h3-serve-<pid>-<n>`.
+fn is_job_name(s: &str) -> bool {
+    s.strip_prefix("h3-serve-").is_some_and(|r| r.split('-').count() == 2 && r.split('-').all(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// Delete a finished job's folder (`DELETE /v1/jobs?id=h3-serve-<pid>-<n>`).
+async fn delete_job(req: HttpRequest) -> HttpResponse {
+    let Some(id) = job_id(&req) else { return error(StatusCode::BAD_REQUEST, "bad job id") };
+    match std::fs::remove_dir_all(std::env::temp_dir().join(&id)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+    states().lock().unwrap().remove(&id);
+    HttpResponse::Ok().content_type("text/plain; charset=utf-8").body("deleted\n")
 }
 
 fn decode_b64(s: &str) -> Result<Vec<u8>> {
@@ -274,27 +313,41 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
 
 /// The engine thread: runs jobs one at a time.
 fn worker(mut eng: Engine, defaults: Defaults, jobs: std_mpsc::Receiver<Job>, pending: Arc<AtomicUsize>) {
-    static N: AtomicUsize = AtomicUsize::new(0);
     for job in jobs {
+        let name = job.name.clone();
         if crate::progress::is_cancelled(job.gen) {
             pending.fetch_sub(1, Ordering::Relaxed);
-            let _ = job.done.send(Err(anyhow!("cancelled")));
+            set_state(&name, "failed: cancelled");
+            if let Some(done) = job.done {
+                let _ = done.send(Err(anyhow!("cancelled")));
+            }
             continue;
         }
         crate::progress::begin(job.gen);
-        let dir = std::env::temp_dir().join(format!("h3-serve-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
-        let _scratch = Scratch(dir.clone());
+        set_state(&name, "running");
+        let want_bytes = job.done.is_some();
+        let dir = std::env::temp_dir().join(&name);
+        let mut scratch = Scratch(dir.clone(), false);
         let r = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| {
             let req = to_request(job.req, &defaults, &dir)?;
             eng.generate(&req)?;
-            Ok(std::fs::read(&req.output)?)
+            Ok(if want_bytes { std::fs::read(&req.output)? } else { Vec::new() })
         });
-        if let Err(e) = &r {
-            eprintln!("[h3] request failed: {e:#}");
+        if r.is_ok() {
+            scratch.keep();
+        }
+        match &r {
+            Ok(_) => set_state(&name, "done"),
+            Err(e) => {
+                eprintln!("[h3] request failed: {e:#}");
+                set_state(&name, format!("failed: {e:#}"));
+            }
         }
         crate::progress::idle();
         pending.fetch_sub(1, Ordering::Relaxed);
-        let _ = job.done.send(r);
+        if let Some(done) = job.done {
+            let _ = done.send(r.map(|mp4| (mp4, name)));
+        }
     }
 }
 
@@ -302,28 +355,87 @@ fn error(status: StatusCode, msg: impl std::fmt::Display) -> HttpResponse {
     HttpResponse::builder(status).content_type("text/plain; charset=utf-8").body(format!("{msg}\n"))
 }
 
-async fn generate(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, req: HttpRequest, body: Bytes) -> HttpResponse {
+fn parse_body(req: &HttpRequest, body: &Bytes) -> Result<GenRequest, HttpResponse> {
     let is_json = req.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("json")) || body.first() == Some(&b'{');
     let g = if is_json {
-        match serde_json::from_slice::<GenRequest>(&body) {
-            Ok(r) => r,
-            Err(e) => return error(StatusCode::BAD_REQUEST, format!("bad JSON: {e}")),
-        }
+        serde_json::from_slice::<GenRequest>(body).map_err(|e| error(StatusCode::BAD_REQUEST, format!("bad JSON: {e}")))?
     } else {
-        GenRequest { prompt: String::from_utf8_lossy(&body).into_owned(), ..Default::default() }
+        GenRequest { prompt: String::from_utf8_lossy(body).into_owned(), ..Default::default() }
     };
     if g.prompt.trim().is_empty() {
-        return error(StatusCode::BAD_REQUEST, "no prompt");
+        return Err(error(StatusCode::BAD_REQUEST, "no prompt"));
     }
-    let (done, rx) = oneshot::channel();
+    Ok(g)
+}
+
+/// Queue a request; the id names its folder in the temp dir.
+fn submit(jobs: &std_mpsc::Sender<Job>, pending: &AtomicUsize, req: GenRequest, done: Option<oneshot::Sender<Result<(Vec<u8>, String)>>>) -> Result<String, HttpResponse> {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let name = format!("h3-serve-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+    set_state(&name, "queued");
     pending.fetch_add(1, Ordering::Relaxed);
-    if jobs.send(Job { req: g, gen: crate::progress::generation(), done }).is_err() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "engine stopped");
+    if jobs.send(Job { req, gen: crate::progress::generation(), name: name.clone(), done }).is_err() {
+        pending.fetch_sub(1, Ordering::Relaxed);
+        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "engine stopped"));
+    }
+    Ok(name)
+}
+
+async fn generate(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, req: HttpRequest, body: Bytes) -> HttpResponse {
+    let g = match parse_body(&req, &body) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    let (done, rx) = oneshot::channel();
+    if let Err(r) = submit(&jobs, &pending, g, Some(done)) {
+        return r;
     }
     match rx.await {
-        Ok(Ok(mp4)) => HttpResponse::Ok().content_type("video/mp4").body(mp4),
+        Ok(Ok((mp4, job))) => HttpResponse::Ok().content_type("video/mp4").header("x-h3-job", job).body(mp4),
         Ok(Err(e)) => error(StatusCode::BAD_REQUEST, format!("{e:#}")),
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "engine stopped"),
+    }
+}
+
+/// `POST /v1/jobs`: queue a request and return its id at once; poll `GET /v1/jobs?id=`.
+async fn create_job(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, req: HttpRequest, body: Bytes) -> HttpResponse {
+    let g = match parse_body(&req, &body) {
+        Ok(g) => g,
+        Err(r) => return r,
+    };
+    match submit(&jobs, &pending, g, None) {
+        Ok(id) => HttpResponse::Accepted().json(&serde_json::json!({ "id": id })),
+        Err(r) => r,
+    }
+}
+
+fn job_id(req: &HttpRequest) -> Option<String> {
+    let id = req.query_string().split('&').find_map(|kv| kv.strip_prefix("id="))?;
+    is_job_name(id).then(|| id.to_string())
+}
+
+/// `GET /v1/jobs?id=`: `{"state": "queued" | "running" | "done" | "failed", "error"?}`. A folder left by an earlier
+/// server run counts as done when its mp4 is there.
+async fn job_state(req: HttpRequest) -> HttpResponse {
+    let Some(id) = job_id(&req) else { return error(StatusCode::BAD_REQUEST, "bad job id") };
+    let st = states().lock().unwrap().get(&id).cloned();
+    let st = st.or_else(|| std::env::temp_dir().join(&id).join("out.mp4").is_file().then(|| "done".to_string()));
+    let body = match st.as_deref() {
+        None => return error(StatusCode::NOT_FOUND, "unknown job"),
+        Some(s) => match s.strip_prefix("failed: ") {
+            Some(e) => serde_json::json!({ "state": "failed", "error": e }),
+            None => serde_json::json!({ "state": s }),
+        },
+    };
+    HttpResponse::Ok().header("cache-control", "no-store").json(&body)
+}
+
+/// `GET /v1/jobs/result?id=`: the finished mp4.
+async fn job_result(req: HttpRequest) -> HttpResponse {
+    let Some(id) = job_id(&req) else { return error(StatusCode::BAD_REQUEST, "bad job id") };
+    match std::fs::read(std::env::temp_dir().join(&id).join("out.mp4")) {
+        Ok(mp4) => HttpResponse::Ok().content_type("video/mp4").body(mp4),
+        Err(_) => error(StatusCode::NOT_FOUND, "no result for this job"),
     }
 }
 
@@ -456,7 +568,7 @@ fn banner(addr: &str, info: &serde_json::Value) {
 async fn serve(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, addr: String, info: serde_json::Value, loras_dir: PathBuf) -> std::io::Result<()> {
     banner(&addr, &info);
     HttpServer::new(async move |_| {
-        let (j1, p1, p2, p3) = (jobs.clone(), pending.clone(), pending.clone(), pending.clone());
+        let (j1, j2, p1, p2, p3, p4) = (jobs.clone(), jobs.clone(), pending.clone(), pending.clone(), pending.clone(), pending.clone());
         let info = info.clone();
         let loras_dir = loras_dir.clone();
         // keyframes and reference media arrive base64-encoded in the JSON body
@@ -484,6 +596,8 @@ async fn serve(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, addr: Str
             .service(
                 web::resource("/v1/generate").route(web::post().to(move |req: HttpRequest, body: Bytes| generate(j1.clone(), p1.clone(), req, body))),
             )
+            .service(web::resource("/v1/jobs").route(web::get().to(job_state)).route(web::delete().to(delete_job)).route(web::post().to(move |req: HttpRequest, body: Bytes| create_job(j2.clone(), p4.clone(), req, body))))
+            .service(web::resource("/v1/jobs/result").route(web::get().to(job_result)))
             .default_service(web::get().to(ui))
     })
     .bind(addr.as_str(), ntex::SharedCfg::new("h3"))?

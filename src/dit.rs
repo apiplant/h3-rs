@@ -471,6 +471,13 @@ pub struct DitRun {
     pub sample_sigmas: Vec<f64>,
 }
 
+impl DitRun {
+    /// Tokens of the packed sequence (video, audio, text, keyframe and reference rows).
+    pub fn seq_len(&self) -> usize {
+        self.layout.seq_len
+    }
+}
+
 pub(crate) struct RunControl {
     pub(crate) cond: ControlCond,
     /// Control patch rows for every video-kind row of the packed sequence (zeros for keyframe / reference rows).

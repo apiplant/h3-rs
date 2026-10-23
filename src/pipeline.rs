@@ -33,6 +33,10 @@ fn dit_activation_bytes(tokens: usize) -> usize {
         tokens * 110_000 + (2 << 30)
     }
 }
+/// Resident DiT blocks that leave `need` bytes of activations free, given `free` VRAM with `base` blocks resident.
+fn blocks_to_keep(base: usize, need: usize, free: usize, block_bytes: usize) -> usize {
+    base.saturating_sub(need.saturating_sub(free).div_ceil(block_bytes.max(1)))
+}
 /// Upscaler activation memory per output latent voxel of a 32-frame segment (512 channels, f16, ~8 live tensors).
 const UPSCALER_BYTES_PER_VOXEL: usize = 8_500;
 const CHUNK_FRAMES: usize = 42;
@@ -488,6 +492,20 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
         None => (w, h),
     };
     let (frame_count, latent_t, audio_t) = temporal_shape(req.length);
+    // Even with every DiT block streamed from RAM, one forward over the delivered canvas keeps its activations in VRAM.
+    // Refuse up front what can't fit rather than after the first pass has spent its minutes.
+    if let Ok((_, total)) = vram_info() {
+        let tokens = latent_t * (fh / 32) * (fw / 32);
+        let need = dit_activation_bytes(tokens) + (1 << 30);
+        if need > total {
+            bail!(
+                "{fw}x{fh} for {:.1} s is {tokens} tokens per forward pass, which needs ~{:.0} GB of activations; this GPU has {:.0} GB. Lower the size, the upscale factor or the length.",
+                frame_count as f64 / FPS as f64,
+                need as f64 / 1e9,
+                total as f64 / 1e9
+            );
+        }
+    }
     progress::check()?;
     progress::stage(Stage::Encoding);
     log::info(&format!(
@@ -899,7 +917,42 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
         *last = Instant::now();
         progress::check()
     };
-    let first_pass = sampling::sample_denoised(&*dit, &run, xv, xa, &sigmas[..=split], req.sampler, inpaint.as_ref(), |i, _| step_log(i, &mut last))?;
+    // `Dit::load` leaves a fixed reserve for activations, which a long or large request outgrows (1024x1024 for 10 s
+    // is ~74k tokens, ~10 GB). Size the resident blocks to this request: the rest stream from RAM every step.
+    let is_oom = |e: &anyhow::Error| format!("{e:?}").contains("OUT_OF_MEMORY");
+    let tokens = run.seq_len();
+    let need = dit_activation_bytes(tokens);
+    let base_resident = dit.resident_blocks();
+    let mut keep = base_resident;
+    crate::kernels::trim_pool();
+    let free = vram_info().map(|(f, _)| f).unwrap_or(usize::MAX);
+    if free < need {
+        keep = blocks_to_keep(base_resident, need, free, dit.block_bytes());
+        log::info(&format!(
+            "{tokens} tokens need ~{:.1} GB of activations, {:.1} GB free: {keep}/{base_resident} DiT blocks stay resident, the rest stream from RAM",
+            need as f64 / 1e9,
+            free as f64 / 1e9
+        ));
+        dit.set_resident(keep)?;
+        crate::kernels::trim_pool();
+    }
+    let mut attempt = 0;
+    let first_pass = loop {
+        attempt += 1;
+        match sampling::sample_denoised(&*dit, &run, xv.clone(), xa.clone(), &sigmas[..=split], req.sampler, inpaint.as_ref(), |i, _| step_log(i, &mut last)) {
+            Ok(s) => break s,
+            Err(e) if keep > 0 && attempt < 6 && is_oom(&e) => {
+                keep = keep.saturating_sub(keep.div_ceil(4).max(4));
+                log::warn(&format!("out of memory while sampling, restarting with {keep} resident DiT blocks"));
+                dit.set_resident(keep)?;
+                crate::kernels::trim_pool();
+                progress::count(Stage::Sampling, 0, req.steps);
+                last = Instant::now();
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    drop((xv, xa));
     drop(inpaint);
     drop(run);
     let (zv, za) = match (&req.upscale, cond_final, upscaler_path) {
@@ -1096,6 +1149,25 @@ mod tests {
         assert!(resolve_guide_frame(124, 124, 1).is_err());
         assert!(resolve_guide_frame(-125, 124, 1).is_err());
         assert!(resolve_guide_frame(100, 124, 39).unwrap_err().to_string().contains("39 frame guide clip"));
+    }
+
+    #[test]
+    fn long_requests_stream_blocks_from_ram() {
+        // 1024x1024, 10 s: 243 frames -> 72 latent frames of 32x32 tokens, plus audio, text and a keyframe
+        let (_, latent_t, _) = temporal_shape(240);
+        assert_eq!(latent_t, 72);
+        let tokens = latent_t * 32 * 32 + 1024 + 600;
+        let need = dit_activation_bytes(tokens);
+        assert!(need > 9_000_000_000 && need < 12_000_000_000, "{need}");
+        let block = 390_000_000;
+        // 36 blocks resident leave ~8 GB free: not enough, so some blocks are given back
+        let keep = blocks_to_keep(36, need, 8_000_000_000, block);
+        assert!(keep < 36 && keep >= 28, "{keep}");
+        assert!(keep * block + need <= 36 * block + 8_000_000_000 + block);
+        // a short request keeps everything resident
+        assert_eq!(blocks_to_keep(36, dit_activation_bytes(37_000), 8_000_000_000, block), 36);
+        // never underflows
+        assert_eq!(blocks_to_keep(3, need, 0, block), 0);
     }
 
     #[test]
