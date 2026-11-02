@@ -50,6 +50,8 @@ export interface Info {
   /** Latent upscaler checkpoint, when the server found one. */
   upscaler: string | null;
   loras: string[];
+  /** Recommendation per LoRA file name: "A" (best), "B" or "C"; unrated LoRAs are absent. */
+  lora_ratings?: Record<string, string>;
   /** Fun ControlNet checkpoints in models/model_patches. */
   controlnets?: string[];
   queued: number;

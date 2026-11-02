@@ -234,6 +234,9 @@ enum Cmd {
     /// Upscale a video file (its audio is kept) or saved latents (`generate --save-latents`) with the latent
     /// upscaler: encode, upscale in latent space, decode. This is the raw learned upscale;
     /// `generate --upscale` also re-noises and refines it with the DiT.
+    ///
+    /// Recommended (best first): A) the plain upscale, B) `--refine` with the official Open-H3-Regenerate-2K LoRA
+    /// (default), C) `--refine` with `--refine-lora minimax_h3_open_regenerate_2k_refiner_rank_384_bf16.safetensors`.
     Upscale {
         /// A video file, or latents saved by `generate --save-latents` (`.safetensors`).
         input: String,
@@ -252,6 +255,20 @@ enum Cmd {
         save_latents: Option<String>,
         #[arg(long, default_value_t = 18)]
         crf: u32,
+        /// Refine instead of a plain upscale: after the latent upscale, re-noise and regenerate with a refiner LoRA
+        /// (Open-H3-Regenerate-2K, 3 steps). The value is the prompt describing the video.
+        #[arg(long)]
+        refine: Option<String>,
+        /// With --refine: LoRA file (path, or name in models/loras).
+        #[arg(long, default_value = "Open-H3-Regenerate-2K/open_h3_regenerate_2k_lora.safetensors")]
+        refine_lora: String,
+        #[arg(long, default_value_t = 1.0)]
+        refine_lora_strength: f64,
+        /// With --refine: comma-separated sigmas, descending to 0 (default 0.909375,0.857143,0.666667,0).
+        #[arg(long, value_delimiter = ',')]
+        sigmas: Option<Vec<f64>>,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
         #[command(flatten)]
         models: Models,
         #[command(flatten)]
@@ -380,7 +397,7 @@ fn main() -> Result<()> {
                 })
                 .transpose()?
                 .map(|p| p.display().to_string());
-            let steps = steps.or(variant.map(|v| v.steps)).unwrap_or(20);
+            let steps = steps.or(lora.as_deref().and_then(h3_rs::lora::preset_steps)).or(variant.map(|v| v.steps)).unwrap_or(20);
             let paths = ModelPaths::resolve(&models.models_dir, variant_dit.as_deref().or(models.dit.as_deref()).unwrap_or(default_dit), &models.text_encoder, &models.video_vae, &models.audio_vae)?
                 .with_upscaler(&models.models_dir, &models.upscaler, upscale.is_some())?;
             let aspect = match aspect {
@@ -501,7 +518,7 @@ fn main() -> Result<()> {
                 info,
             )?;
         }
-        Cmd::Upscale { input, scale, width, height, output, save_latents, crf, models, mem } => {
+        Cmd::Upscale { input, scale, width, height, output, save_latents, crf, refine, refine_lora, refine_lora_strength, sigmas, seed, models, mem } => {
             let memc = mem.resolve()?;
             let dev = h3_rs::backend::new_device(mem.device)?;
             h3_rs::kernels::keep_pool_memory(&dev);
@@ -542,7 +559,25 @@ fn main() -> Result<()> {
                     (r32(w as f64 * 16.0 * s), r32(h as f64 * 16.0 * s))
                 }
             };
-            let zv = pipeline::upscale_video_latent(paths.upscaler.as_ref().unwrap(), &dev, &zv, (th / 16, tw / 16))?;
+            let (zv, za) = match &refine {
+                Some(prompt) => {
+                    let lora = if std::path::Path::new(&refine_lora).is_file() { refine_lora.clone() } else { h3_rs::download::ensure(&models.models_dir.join("loras"), &refine_lora)?.display().to_string() };
+                    let req = pipeline::Refine {
+                        prompt: prompt.clone(),
+                        lora: (lora, refine_lora_strength),
+                        sigmas: sigmas.clone().unwrap_or_else(|| pipeline::REFINE_SIGMAS.to_vec()),
+                        cells: Some((th / 16, tw / 16)),
+                        seed,
+                        sampler: h3_rs::sampling::Sampler::Euler,
+                        shift_video: 12.0,
+                        shift_audio: 3.0,
+                    };
+                    let mut eng = pipeline::Engine::new(paths.clone(), None, memc.clone(), dev.clone(), false);
+                    let (zv, za_out) = eng.refine(&req, &zv, za.as_ref())?;
+                    (zv, Some(za_out).filter(|_| !is_video))
+                }
+                None => (pipeline::upscale_video_latent(paths.upscaler.as_ref().unwrap(), &dev, &zv, (th / 16, tw / 16))?, za),
+            };
             let frame_count = pipeline::frames_for_latent(zv.dim(2)?);
             match (source, za) {
                 (Some((n, path)), _) => {

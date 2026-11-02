@@ -504,6 +504,8 @@ fn list_loras(dir: &std::path::Path) -> Vec<String> {
     names.extend(crate::download::known(sub).map(String::from));
     names.sort();
     names.dedup();
+    // recommended LoRAs first (stable: alphabetical within a rating)
+    names.sort_by_key(|n| crate::lora::rating_rank(n));
     names
 }
 
@@ -581,7 +583,11 @@ async fn serve(jobs: std_mpsc::Sender<Job>, pending: Arc<AtomicUsize>, addr: Str
             .service(web::resource("/v1/info").route(web::get().to(move || {
                 let mut i = info.clone();
                 i["queued"] = serde_json::json!(p2.load(Ordering::Relaxed));
-                i["loras"] = serde_json::json!(list_loras(&loras_dir));
+                let loras = list_loras(&loras_dir);
+                let ratings: serde_json::Map<String, serde_json::Value> =
+                    loras.iter().filter_map(|n| crate::lora::rating(n).map(|r| (n.clone(), serde_json::json!(r.to_string())))).collect();
+                i["loras"] = serde_json::json!(loras);
+                i["lora_ratings"] = serde_json::Value::Object(ratings);
                 i["controlnets"] = serde_json::json!(list_loras(&loras_dir.with_file_name("model_patches")));
                 async move { HttpResponse::Ok().json(&i) }
             })))

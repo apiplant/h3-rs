@@ -14,6 +14,8 @@ files as-is:
 | `model_patches/*.safetensors` (optional) | MiniMax H3 Fun ControlNet (int8 or dense blocks, v1 5 / v2 10 control blocks) | `control.rs` |
 | `latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors` (optional) | fp16 3D-conv latent upscaler ([LBH-123-AI](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler), MIT) | `upscaler.rs` |
 
+LoRA recommendations (a 768p comparison, rated by eye): **A** `MiniMax-H3-FL2VA-Acc-8Step`, `Pika-H3-Flex-Turbo/pika_h3_flex_turbo_8step_hd_fl2va`; **B** `taomate_fl2va_3step`, `pdmd_4step`, `flashgen_4step`, `DMAD_4step`, `pika_h3_flex_turbo_4step_fl2va` (+ `lite_r32`); **C** `pdmd_2step`. The web UI lists A first and tags each `[A]`/`[B]`/`[C]`. Other LoRAs are unrated.
+
 Missing files are downloaded automatically from Hugging Face (resumable, into `--models-dir`): the four required models at startup, everything else (reference DiT, LoRAs, ControlNets, the upscaler) the first time it's used. Set `H3_NO_DOWNLOAD=1` to disable, `HF_ENDPOINT` to use a mirror.
 
 Quantized weights stay quantized in memory. CUDA uses NVRTC kernels; Apple Silicon uses MLX int8 matrix multiplication and attention, with Candle Metal for the rest of the pipeline. NVFP4 text-encoder weights are decoded one layer at a time.
@@ -144,6 +146,9 @@ h3 generate -p "..." --width 1376 --height 768 --upscale 2     # -> 2752x1536
 h3 generate -p "..." --save-latents run.safetensors
 h3 decode run.safetensors -o run.mp4
 
+# Upscale recommendations (best first): A) plain learned upscale (fastest, keeps the draft as is), B) --refine with the
+# official Open-H3-Regenerate-2K LoRA (default of --refine-lora; adds detail, ~4x slower), C) --refine with Kijai's
+# minimax_h3_open_regenerate_2k_refiner_rank_384_bf16 (similar cost, shifts the look more).
 # raw learned upscale of saved latents, decoded at the new size (no refining pass)
 h3 upscale run.safetensors -o run_1.5x.mp4                  # --scale 2, or --width 2048 [--height ...]; also takes a video file
 ```

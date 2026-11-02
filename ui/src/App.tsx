@@ -1128,14 +1128,14 @@ export function App() {
                   <Show when={info()?.default_lora}>
                     <option value="none">None</option>
                   </Show>
-                  <For each={info()?.loras ?? []}>{(l) => <option value={l}>{l.replace(/\.safetensors$/, "")}</option>}</For>
+                  <For each={info()?.loras ?? []}>{(l) => <option value={l}>{info()?.lora_ratings?.[l] ? `[${info()!.lora_ratings![l]}] ` : ""}{l.replace(/\.safetensors$/, "")}</option>}</For>
                 </select>
                 <Icon name="chevron" size={13} class="pointer-events-none absolute top-2.5 right-2.5 text-ink-400" />
               </div>
               <Show when={lora() && lora() !== "none"}>
                 <Slider label="Strength" value={loraStrength()} min={0} max={2} step={0.05} digits={2} onChange={setLoraStrength} />
               </Show>
-              <p class="mt-1.5 text-xs leading-snug text-ink-500">Turbo LoRAs need fewer steps: 8 for text and frames, 4 for references. A new LoRA is merged on the first request that uses it.</p>
+              <p class="mt-1.5 text-xs leading-snug text-ink-500">Turbo LoRAs need fewer steps: 8 for text and frames, 4 for references. A new LoRA is merged on the first request that uses it. Rated LoRAs are listed first: [A] recommended, [B] works but weaker, [C] not recommended.</p>
               <div class="mt-2 flex gap-1.5">
                 <button class={`${chipBtn} !px-2`} onClick={() => setSteps("8")}>8 steps</button>
                 <button class={`${chipBtn} !px-2`} onClick={() => setSteps("4")}>4 steps</button>

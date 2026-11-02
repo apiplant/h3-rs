@@ -107,6 +107,24 @@ impl Default for Upscale {
     }
 }
 
+/// The Open-H3-Regenerate-2K refiner schedule: three Euler steps from sigma 0.909 (CFG 1).
+pub const REFINE_SIGMAS: [f64; 4] = [0.909375, 0.857143, 0.666667, 0.0];
+
+/// A refine pass over a draft's latents (see [`Engine::refine`]).
+#[derive(Debug, Clone)]
+pub struct Refine {
+    pub prompt: String,
+    /// Refiner LoRA (path, strength).
+    pub lora: (String, f64),
+    pub sigmas: Vec<f64>,
+    /// Latent grid (h, w) to upscale the draft to first; `None` keeps its size.
+    pub cells: Option<(usize, usize)>,
+    pub seed: u64,
+    pub sampler: Sampler,
+    pub shift_video: f64,
+    pub shift_audio: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Request {
     pub prompt: String,
@@ -1059,6 +1077,121 @@ pub fn decode_frames(&mut self, zv: &Tensor, frame_count: usize) -> Result<Tenso
     let frames = frames.narrow(1, 0, nf)?.permute((1, 0, 2, 3))?.contiguous()?; // [F, 3, H, W]
     log::info(&format!("video decoded: {nf} frames in {:.1}s", t.elapsed().as_secs_f64()));
     Ok(frames)
+}
+
+/// Re-generate a draft's latent at a larger size with a refiner LoRA (Open-H3-Regenerate-2K): upscale the latent,
+/// re-noise it to the first sigma of `req.sigmas` (CONST: x = sigma * noise + (1 - sigma) * latent) and run those
+/// few steps with the LoRA attached. `za` is the draft's own audio latent (kept, re-noised alongside), if any.
+/// Returns the refined `(video, own audio)` latents.
+pub fn refine(&mut self, req: &Refine, zv: &Tensor, za: Option<&Tensor>) -> Result<(Tensor, Tensor)> {
+    let dev = self.dev.clone();
+    if req.sigmas.len() < 2 || req.sigmas.windows(2).any(|w| w[1] >= w[0]) {
+        bail!("refine needs a decreasing sigma list with at least 2 values");
+    }
+    let latent_t = zv.dim(2)?;
+    let cells = req.cells.unwrap_or((zv.dim(3)?, zv.dim(4)?));
+    let frame_count = frames_for_latent(latent_t);
+    let audio_t = (frame_count as f64 / FPS as f64 * AUDIO_LATENT_FPS as f64).round() as usize;
+
+    // text conditioning
+    let tok = self.tokenizer()?;
+    let pieces = tok.presentation(&req.prompt, &[])?;
+    let enc = self.text_encoder()?.encode(&pieces)?;
+    self.release("te");
+
+    // the learned latent upscale
+    let zv_up = if cells != (zv.dim(3)?, zv.dim(4)?) {
+        let path = match &self.paths.upscaler {
+            Some(p) => p.clone(),
+            None => {
+                let p = crate::download::ensure(&self.paths.models_dir.join("latent_upscale_models"), DEFAULT_UPSCALER)?;
+                self.paths.upscaler = Some(p.clone());
+                p
+            }
+        };
+        if let Some((_, d)) = self.dit.as_mut() {
+            d.set_resident(0)?;
+        }
+        crate::kernels::trim_pool();
+        upscale_video_latent(&path, &dev, zv, cells)?
+    } else {
+        zv.clone()
+    };
+
+    let dit_path = self.paths.dit.clone();
+    let lora = Some((req.lora.0.clone(), req.lora.1));
+    let dit = self.dit(&dit_path, lora.as_ref())?;
+    dit.cfg.shift_video = req.shift_video;
+    dit.cfg.shift_audio = req.shift_audio;
+    let audio_scale = dit.audio_scale();
+    let cond = DitCond {
+        text: enc.hidden,
+        tags: Some(enc.tags),
+        keyframes: vec![],
+        refs: vec![],
+        seed: req.seed,
+        visual_cond_noise_aug: VISUAL_COND_TIMESTEP,
+        audio_cond_noise_aug: AUDIO_COND_TIMESTEP,
+        denoise: None,
+        control: None,
+    };
+    let vshape = [1usize, 24, latent_t, cells.0, cells.1];
+    let run = dit.prepare(&cond, &vshape, audio_t, req.sigmas.clone())?;
+    let need = dit_activation_bytes(run.seq_len());
+    crate::kernels::trim_pool();
+    let free = vram_info().map(|(f, _)| f).unwrap_or(usize::MAX);
+    let base_resident = dit.resident_blocks();
+    let mut keep = base_resident;
+    if free < need {
+        keep = blocks_to_keep(base_resident, need, free, dit.block_bytes());
+        log::info(&format!("{} tokens need ~{:.1} GB: {keep}/{base_resident} DiT blocks stay resident", run.seq_len(), need as f64 / 1e9));
+        dit.set_resident(keep)?;
+        crate::kernels::trim_pool();
+    }
+    let sig0 = req.sigmas[0];
+    let n = req.sigmas.len() - 1;
+    let mut attempt = 0;
+    let (xv, xa) = loop {
+        attempt += 1;
+        let mut gen = crate::rng::TorchGen::new(req.seed);
+        let nv = gen.randn_tensor(&vshape, &dev)?;
+        let na = gen.randn_tensor(&[1, 32, 2, audio_t], &dev)?;
+        let carried = match za {
+            Some(z) => (z * audio_scale)?,
+            None => na.zeros_like()?,
+        };
+        let xv = ((&nv * sig0)? + (&zv_up * (1.0 - sig0))?)?;
+        let xa = ((&na * sig0)? + (&carried * (1.0 - sig0))?)?;
+        drop(nv);
+        progress::stage(Stage::Sampling);
+        progress::count(Stage::Sampling, 0, n);
+        let mut last = Instant::now();
+        let r = sampling::sample(&*dit, &run, xv, xa, &req.sigmas, req.sampler, None, |i, _| {
+            progress::count(Stage::Sampling, i, n);
+            log::info(&format!("refine step {i}/{n}  {:.3}s/it  ({})", last.elapsed().as_secs_f64(), vram()));
+            last = Instant::now();
+            progress::check()
+        });
+        match r {
+            Ok(o) => break o,
+            Err(e) if keep > 0 && attempt < 6 && format!("{e:?}").contains("OUT_OF_MEMORY") => {
+                keep = keep.saturating_sub(keep.div_ceil(4).max(4));
+                log::warn(&format!("out of memory refining, retrying with {keep} resident DiT blocks"));
+                dit.set_resident(keep)?;
+                crate::kernels::trim_pool();
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    drop(run);
+    if self.keep {
+        crate::kernels::trim_pool();
+        if let Some((_, d)) = self.dit.as_mut() {
+            d.set_resident(base_resident)?;
+        }
+    }
+    self.release("dit");
+    Ok((xv, (xa / audio_scale)?))
 }
 
 /// Decode latents and mux them into an MP4.

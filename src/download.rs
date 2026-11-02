@@ -22,6 +22,11 @@ struct Known {
     mb: u32,
 }
 
+
+const fn lora(name: &'static str, url: &'static str, mb: u32) -> Known {
+    Known { sub: "loras", name, url: Some(url), mb }
+}
+
 const fn k(sub: &'static str, name: &'static str, mb: u32) -> Known {
     Known { sub, name, url: None, mb }
 }
@@ -39,6 +44,30 @@ const KNOWN: &[Known] = &[
     k("model_patches", "minimax_h3_fun_controlnet_union_2.0_pruned_int8_convrot.safetensors", 0),
     k("model_patches", "minimax_h3_fun_controlnet_union_pruned_int8_convrot.safetensors", 0),
     Known { sub: "latent_upscale_models", name: "minimax_h3_latent_upscaler_3d_conv_v1_fp16.safetensors", url: Some(UPSCALER_URL), mb: 691 },
+    // Kijai/MiniMax-H3-experimental: step-distillation and refiner LoRAs
+    lora("MiniMax-H3-FL2VA-Acc-8Step_comfy.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "MiniMax-H3-FL2VA-Acc-8Step_comfy.safetensors"), 1_724),
+    lora("MiniMax-H3-FL2VA-Acc-8Step_pruned_comfy.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "MiniMax-H3-FL2VA-Acc-8Step_pruned_comfy.safetensors"), 1_726),
+    lora("MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "MiniMax-H3-Ref2VA-Acc-8Step_comfy.safetensors"), 1_724),
+    lora("MiniMax-H3-Ref2VA-Acc-8Step_pruned_comfy.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "MiniMax-H3-Ref2VA-Acc-8Step_pruned_comfy.safetensors"), 1_726),
+    lora("minimax_h3_4step_lora_flashgen_v1.0_768p_fl2va_pruned_avg_rank_13_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_4step_lora_flashgen_v1.0_768p_fl2va_pruned_avg_rank_13_bf16.safetensors"), 186),
+    lora("minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors"), 367),
+    lora("minimax_h3_ELM_longlive_plug_4step_lora_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_ELM_longlive_plug_4step_lora_bf16.safetensors"), 1_956),
+    lora("minimax_h3_open_regenerate_2k_refiner_rank_16_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_open_regenerate_2k_refiner_rank_16_bf16.safetensors"), 155),
+    lora("minimax_h3_open_regenerate_2k_refiner_rank_384_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_open_regenerate_2k_refiner_rank_384_bf16.safetensors"), 5_868),
+    lora("minimax_h3_pdmd_2step_lora_avg_rank_38_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_pdmd_2step_lora_avg_rank_38_bf16.safetensors"), 381),
+    lora("minimax_h3_pdmd_4step_lora_avg_rank_57_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_pdmd_4step_lora_avg_rank_57_bf16.safetensors"), 559),
+    lora("minimax_h3_ref_lora_rank_256_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_ref_lora_rank_256_bf16.safetensors"), 2_578),
+    lora("minimax_h3_singularity_v2_lora_avg_rank_351_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_singularity_v2_lora_avg_rank_351_bf16.safetensors"), 3_300),
+    lora("minimax_h3_taomate_fl2va_3step_avg_rank_19_bf16.safetensors", concat!("https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/", "minimax_h3_taomate_fl2va_3step_avg_rank_19_bf16.safetensors"), 177),
+    // Efficient-Large-Model/Open-H3-Regenerate-2K (`h3 upscale --refine`)
+    lora("Open-H3-Regenerate-2K/open_h3_regenerate_2k_lora.safetensors", concat!("https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K/resolve/main/lora/", "open_h3_regenerate_2k_lora.safetensors"), 12_452),
+    // taobao-content-ai/MiniMax-H3-PTD-RefAsymOPD-LoRAs (ref2va)
+    lora("PTD-RefAsymOPD/MiniMax-H3-Ref2VA-PTD-RefAsymOPD-6Step.safetensors", concat!("https://huggingface.co/taobao-content-ai/MiniMax-H3-PTD-RefAsymOPD-LoRAs/resolve/main/", "MiniMax-H3-Ref2VA-PTD-RefAsymOPD-6Step.safetensors"), 8_310),
+    lora("PTD-RefAsymOPD/MiniMax-H3-Ref2VA-PTD-RefAsymOPD-8Step.safetensors", concat!("https://huggingface.co/taobao-content-ai/MiniMax-H3-PTD-RefAsymOPD-LoRAs/resolve/main/", "MiniMax-H3-Ref2VA-PTD-RefAsymOPD-8Step.safetensors"), 11_113),
+    // akhaliq/Pika-H3-Flex-Turbo-LoRA (video shift 6.0 for fl2va, CFG 1)
+    lora("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_4step_fl2va.safetensors", concat!("https://huggingface.co/akhaliq/Pika-H3-Flex-Turbo-LoRA/resolve/main/", "pika_h3_flex_turbo_4step_fl2va.safetensors"), 3_912),
+    lora("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_4step_fl2va_lite_r32.safetensors", concat!("https://huggingface.co/akhaliq/Pika-H3-Flex-Turbo-LoRA/resolve/main/", "pika_h3_flex_turbo_4step_fl2va_lite_r32.safetensors"), 310),
+    lora("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_8step_hd_fl2va.safetensors", concat!("https://huggingface.co/akhaliq/Pika-H3-Flex-Turbo-LoRA/resolve/main/", "pika_h3_flex_turbo_8step_hd_fl2va.safetensors"), 3_912),
 ];
 
 /// Files this library knows how to download into `<models_dir>/<sub>/`.
@@ -64,7 +93,7 @@ pub fn ensure(dir: &Path, name: &str) -> Result<PathBuf> {
         Some(u) => u.to_string(),
         None => format!("{}/{}/{}", HF.replacen("https://huggingface.co", &endpoint(), 1), f.sub, f.name),
     };
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(path.parent().unwrap_or(dir))?;
     fetch(&url, &path, f.mb).with_context(|| format!("downloading {name}"))?;
     Ok(path)
 }

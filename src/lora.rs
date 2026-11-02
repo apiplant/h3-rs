@@ -101,3 +101,55 @@ fn pad_to(t: &Tensor, shape: &[usize]) -> Result<Tensor> {
     }
     Ok(t)
 }
+
+/// Sampling steps a known distillation LoRA is meant for, from its file name (`None` for style/refiner LoRAs).
+pub fn preset_steps(name: &str) -> Option<usize> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("refiner") || n.contains("regenerate") || n.contains("ref_lora") || n.contains("singularity") {
+        return None;
+    }
+    [("2step", 2), ("3step", 3), ("4step", 4), ("6step", 6), ("8step", 8)].iter().find(|(k, _)| n.contains(k)).map(|(_, s)| *s)
+}
+
+/// How strongly we recommend a known LoRA (`'A'` best, then `'B'`, `'C'`), from a few-step comparison on a 768p clip.
+/// `None` for LoRAs we haven't rated (style LoRAs, a user's own files).
+pub fn rating(name: &str) -> Option<char> {
+    let n = name.rsplit('/').next().unwrap_or(name).to_ascii_lowercase();
+    let has = |k: &str| n.contains(k);
+    if has("fl2va-acc-8step") || has("flex_turbo_8step_hd_fl2va") {
+        Some('A')
+    } else if has("taomate") || has("pdmd_4step") || has("flashgen") || has("dmad") || has("flex_turbo_4step_fl2va") {
+        Some('B')
+    } else if has("pdmd_2step") {
+        Some('C')
+    } else {
+        None
+    }
+}
+
+/// Sort key for lists: recommended (A) first, then unrated, then B, then C.
+pub fn rating_rank(name: &str) -> u8 {
+    match rating(name) {
+        Some('A') => 0,
+        None => 1,
+        Some('B') => 2,
+        _ => 3,
+    }
+}
+
+#[cfg(test)]
+mod rating_tests {
+    use super::*;
+
+    #[test]
+    fn rates_known_loras() {
+        assert_eq!(rating("minimax_h3_taomate_fl2va_3step_avg_rank_19_bf16.safetensors"), Some('B'));
+        assert_eq!(rating("MiniMax-H3-FL2VA-Acc-8Step_pruned_comfy.safetensors"), Some('A'));
+        assert_eq!(rating("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_8step_hd_fl2va.safetensors"), Some('A'));
+        assert_eq!(rating("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_4step_fl2va_lite_r32.safetensors"), Some('B'));
+        assert_eq!(rating("minimax_h3_pdmd_4step_lora_avg_rank_57_bf16.safetensors"), Some('B'));
+        assert_eq!(rating("minimax_h3_pdmd_2step_lora_avg_rank_38_bf16.safetensors"), Some('C'));
+        assert_eq!(rating("minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"), None);
+        assert!(rating_rank("MiniMax-H3-FL2VA-Acc-8Step_pruned_comfy.safetensors") < rating_rank("my_style.safetensors"));
+    }
+}
