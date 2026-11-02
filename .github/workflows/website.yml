@@ -1,0 +1,48 @@
+name: website
+
+# Build and deploy the marketing/docs site (website/) to Cloudflare Workers
+# on every push to master that touches it. Needs two repository secrets:
+# CLOUDFLARE_API_TOKEN (Workers edit permission) and CLOUDFLARE_ACCOUNT_ID.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "website/**"
+      - "Cargo.toml"
+      - ".github/workflows/website.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: website/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      # tsc + vite build; the site must serve dist/, never the source index.html.
+      - run: pnpm build
+      - name: Refuse to deploy an unbuilt page
+        run: |
+          grep -q '/assets/' dist/index.html
+          ! grep -q '/src/index.tsx' dist/index.html
+      - run: pnpm wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
