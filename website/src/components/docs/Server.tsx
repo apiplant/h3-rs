@@ -13,12 +13,14 @@ export function DocsServer() {
 
       <Section>
         <H2>Start it</H2>
-        <CopyBlock command={`h3 serve --addr 127.0.0.1:8188 --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8`} />
+        <CopyBlock command={`h3 serve --model 10eros-learned --addr 127.0.0.1:8188`} />
         <P>
+          This selects the learned Eros checkpoint used by its two-pass workflow and downloads it if it is not already in your models folder.
           The text encoder and the VAE decoder are streamed from RAM and the DiT blocks fill the rest of the GPU, so one process holds
-          everything. A warm 8-step 640×352 request takes about 12 s end to end on an RTX 4090. Open <IC>http://127.0.0.1:8188/</IC>
+          everything. Open <IC>http://127.0.0.1:8188/</IC>
           for the studio and <IC>/docs</IC> for the API reference (rendered from <IC>/openapi.json</IC>).
         </P>
+        <P>Run <IC>h3 serve</IC> without <IC>--model</IC> to choose from the startup menu. The two older TenStrip Eros variants remain available through the CLI flags <IC>--model 10eros</IC> and <IC>--model 10eros-hybrid</IC>.</P>
       </Section>
 
       <Section>

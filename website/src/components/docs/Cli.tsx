@@ -24,6 +24,9 @@ h3 generate -p "<Picture 1> walks through the scene of <Video 1>, speaking with 
 # official turbo LoRAs: 8 steps for text/frames, 4 for references
 h3 generate -p "..." --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors --steps 8
 
+# start the server with the learned 10Eros checkpoint (downloaded on first use)
+h3 serve --model 10eros-learned
+
 # save the latents, then decode again later
 h3 generate -p "..." --save-latents run.safetensors
 h3 decode run.safetensors -o run.mp4`}
@@ -59,8 +62,12 @@ h3 decode run.safetensors -o run.mp4`}
 
       <Section>
         <H2>Models and memory</H2>
+        <P>
+          Eros checkpoints are omitted from the startup chooser and <IC>h3 models</IC> list. Run the learned checkpoint explicitly with <IC>h3 serve --model 10eros-learned</IC>; the older TenStrip variants remain available with <IC>h3 serve --model 10eros</IC> or <IC>h3 serve --model 10eros-hybrid</IC>.
+        </P>
         <FlagTable
           rows={[
+            { flag: "--model 10eros-learned", meaning: "The workflow-specific learned HQ checkpoint; fetched from Hugging Face if it is missing." },
             { flag: "--models-dir DIR", meaning: "The ComfyUI models folder. Default: $H3_MODELS_DIR, ./models or ~/ComfyUI/models when they exist, else ~/.cache/h3-rs/models." },
             { flag: "--dit, --text-encoder, --video-vae, --audio-vae", meaning: "Override single files by name or path." },
             { flag: "--preset gb24|gb16|gb12|gb8|minimal|auto", meaning: "Memory preset (default gb24). See Memory presets." },

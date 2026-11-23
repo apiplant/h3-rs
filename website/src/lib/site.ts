@@ -78,6 +78,10 @@ cargo install h3-rs --no-default-features --features mlx,serve   # Apple Silicon
       body: "int8 + ConvRot DiT, NVFP4 + AWQ Qwen3-VL text encoder, fp16 video VAE, fp32 audio VAE: straight from your ComfyUI models folder.",
     },
     {
+      title: "10Eros learned HQ",
+      body: "Run the learned Eros checkpoint explicitly with --model 10eros-learned; h3-rs downloads it on first use and supports stacking its MLP LoRAs.",
+    },
+    {
       title: "Faster than ComfyUI",
       body: "A fused int8 tensor-core GEMM and an int8 flash-style attention kernel: 13.0 s per step at 1344×768 against 15.6 s.",
     },

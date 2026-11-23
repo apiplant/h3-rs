@@ -33,6 +33,8 @@ export interface GenerateRequest {
   control_end?: number;
   lora?: string;
   lora_strength?: number;
+  /** Ordered LoRA stack. An empty array explicitly disables the server default. */
+  loras?: { name: string; strength: number }[];
   /** Sample at 1/N of the size, upscale the latent, refine at full size. */
   upscale?: number;
   /** With `upscale`: fraction of the steps sampled at the low resolution. */
@@ -47,6 +49,7 @@ export interface Info {
   text_encoder: string;
   default_steps: number;
   default_lora: string | null;
+  default_loras?: { name: string; strength: number }[];
   /** Latent upscaler checkpoint, when the server found one. */
   upscaler: string | null;
   loras: string[];

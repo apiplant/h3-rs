@@ -46,7 +46,7 @@ fn main() -> Result<()> {
             "dit" => {
                 let r = SafeFile::open(format!("{dir}/dit_fwd.safetensors"))?;
                 let mem = Preset::Gb24.config();
-                let mut dit = h3_rs::dit::Dit::load(&format!("{M}/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), &dev, &mem, None)?;
+                let mut dit = h3_rs::dit::Dit::load(&format!("{M}/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"), &dev, &mem, &[])?;
                 dit.capture_blocks = vec![0, 1, 49];
                 let ctx = r.load("ctx", &dev)?.get(0)?;
                 let refined = dit.refine_text(&ctx)?;

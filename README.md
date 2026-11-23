@@ -155,6 +155,9 @@ h3 upscale run.safetensors -o run_1.5x.mp4                  # --scale 2, or --wi
 
 Models resolve under `--models-dir` (env `H3_MODELS_DIR`; default `./models` or `~/ComfyUI/models` if present, else `~/.cache/h3-rs/models`). Override
 individual files with `--dit`, `--text-encoder`, `--video-vae`, `--audio-vae` (name or path).
+LokkenJP's workflow-specific `10Eros_Max_8stepTurbo_v1.0_hybrid_activation_learned_HQ.safetensors` checkpoint is available explicitly with `h3 serve --model 10eros-learned`; it downloads on first use, and an existing file in `diffusion_models/` is used directly. This checkpoint and the older TenStrip checkpoints are omitted from the startup chooser and `h3 models` list, but remain available with `--model 10eros-learned`, `--model 10eros`, or `--model 10eros-hybrid`. Its linked two-pass workflow can be approximated with `--upscale`, but the LCM sampler, separate `linear_quadratic` refinement schedule, and 2D upscaler are not yet reproduced exactly by h3-rs.
+
+The UI can download TenStrip's MLP patch LoRAs when selected in the LoRA stack. They can be combined with other compatible LoRAs. The workflow-specific checkpoint is optional; the two TenStrip variants above remain available.
 Frame counts snap up to the model's 17k+5 grid at 24 fps; sizes snap to multiples of 32. Noise matches ComfyUI's
 `RandomNoise` (torch mt19937 `randn`, video then audio from one generator), so a seed gives the same starting
 latent as in ComfyUI.
@@ -175,7 +178,7 @@ curl -o out.mp4 -H 'content-type: application/json' localhost:8188/v1/generate \
 `POST /v1/generate` takes JSON: `prompt` (required), `width`, `height`, `megapixels`, `aspect`, `seconds` or
 `length`, `steps`, `seed`, `sampler`, `shift_video`, `shift_audio`, `image` / `last_image` (base64, `data:` URLs
 accepted), `fit`, `guides` (`[{kind: image|audio, data, frame}]`), `source` / `source_mute` / `mask` / `mask_audio`, `controlnet` / `control_video` / `control_strength` / `control_start` / `control_end`, `ref_images` / `ref_videos` / `ref_audios` (base64 lists), `ref_video_mute`, `ref_image_size`,
-`lora` (file name in `models/loras`, `"none"` to disable the server default), `lora_strength`, `upscale` (factor, as `--upscale`) with `upscale_split`, `crf`. It returns
+`lora` / `lora_strength` for one LoRA, or `loras: [{"name": ..., "strength": ...}]` to stack several (an empty `loras` array disables the server default), `upscale` (factor, as `--upscale`) with `upscale_split`, `crf`. The CLI accepts repeated `--lora` flags to build a stack. It returns
 `video/mp4`. `GET /` is a web studio (text / keyframes / references, live progress, takes; source in `ui/`, embedded in the binary),
 `GET /v1/info` lists models, memory settings, available LoRAs and queue length, `GET /v1/status` reports the stage and
 step of the running request, `GET /openapi.json` and `GET /docs` describe the API, `GET /health` returns `ok`. A warm 8-step 640×352 request takes about 12 s end to end.

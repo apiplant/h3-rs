@@ -10,8 +10,8 @@
 //!   "ref_video_mute", "ref_audios": [b64], "ref_image_size": "match"|"max",
 //!   "guides": [{"kind": "image"|"audio", "data": b64, "frame": 0}], "source": b64, "source_mute", "mask": b64,
 //!   "mask_audio": "follow"|"keep"|"generate", "controlnet": name, "control_video": b64, "control_strength",
-//!   "control_start", "control_end", "lora": name,
-//!   "lora_strength", "upscale", "upscale_split", "crf"}` (only `prompt` is required; media fields are base64 file contents, a
+//!   "control_start", "control_end", "lora": name, "lora_strength", "loras": [{"name", "strength"}],
+//!   "upscale", "upscale_split", "crf"}` (only `prompt` is required; media fields are base64 file contents, a
 //!   `data:` URL prefix is accepted). Returns `video/mp4`. A plain-text body is taken as the prompt.
 //! - `GET /v1/info`: models, memory settings, available LoRAs, queue length. `GET /v1/status`: what the engine is
 //!   doing right now (stage and step), for progress bars. `GET /health`: `ok`.
@@ -39,7 +39,7 @@ use crate::sampling::Sampler;
 #[derive(Clone)]
 pub struct Defaults {
     pub steps: usize,
-    pub lora: Option<(String, f64)>,
+    pub loras: Vec<(String, f64)>,
     pub loras_dir: PathBuf,
     /// Fun ControlNet checkpoints (`models/model_patches`).
     pub patches_dir: PathBuf,
@@ -100,14 +100,23 @@ struct GenRequest {
     control_strength: Option<f64>,
     control_start: Option<f64>,
     control_end: Option<f64>,
-    /// LoRA file name in models/loras ("" or "none" disables the server default)
+    /// Legacy single LoRA file name in models/loras ("" or "none" disables the server default).
     lora: Option<String>,
     lora_strength: Option<f64>,
+    /// Ordered LoRA stack. When present, including an empty list, it overrides the server default.
+    loras: Option<Vec<LoraIn>>,
     /// Sample at 1/N of the size, upscale the latent, refine at full size (0 or 1: off)
     upscale: Option<f64>,
     /// With `upscale`: fraction of the steps sampled at the low resolution (default 0.5)
     upscale_split: Option<f64>,
     crf: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoraIn {
+    name: String,
+    strength: Option<f64>,
 }
 
 struct Job {
@@ -241,16 +250,28 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
             })
         }
     };
-    let lora = match g.lora.as_deref() {
-        Some("") | Some("none") => None,
-        Some(name) => {
-            let p = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { crate::download::ensure(&d.loras_dir, name)? };
-            if !p.is_file() {
-                anyhow::bail!("LoRA {name} not found");
-            }
-            Some((p.display().to_string(), g.lora_strength.unwrap_or(1.0)))
+    let resolve_lora = |name: &str, strength: f64| -> Result<Option<(String, f64)>> {
+        if name.is_empty() || name == "none" {
+            return Ok(None);
         }
-        None => d.lora.clone().map(|(p, s)| (p, g.lora_strength.unwrap_or(s))),
+        let p = if std::path::Path::new(name).is_absolute() { PathBuf::from(name) } else { crate::download::ensure(&d.loras_dir, name)? };
+        if !p.is_file() {
+            anyhow::bail!("LoRA {name} not found");
+        }
+        Ok(Some((p.display().to_string(), strength)))
+    };
+    let loras = match g.loras {
+        Some(stack) => stack
+            .into_iter()
+            .map(|l| resolve_lora(&l.name, l.strength.unwrap_or(1.0)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+        None => match g.lora.as_deref() {
+            Some(name) => resolve_lora(name, g.lora_strength.unwrap_or(1.0))?.into_iter().collect(),
+            None => d.loras.iter().map(|(p, s)| (p.clone(), g.lora_strength.unwrap_or(*s))).collect(),
+        },
     };
     let aspect = g
         .aspect
@@ -297,7 +318,7 @@ fn to_request(g: GenRequest, d: &Defaults, dir: &std::path::Path) -> Result<Requ
         shift_audio: g.shift_audio.unwrap_or(3.0),
         first_frame,
         last_frame,
-        lora,
+        loras,
         guides,
         source,
         source_mute: g.source_mute,

@@ -26,6 +26,45 @@ pub fn dequant_i8(q: &Tensor, scale: &Tensor, out: DType) -> Result<Tensor> {
     Tensor::from_vec(v, (n, k), q.device())?.to_dtype(out)
 }
 
+/// Unpack ComfyUI W6A8's nibble plus 2-bit planes into grouped-scale int8 weights.
+/// The first K/2 bytes hold two low nibbles; the next K/4 bytes hold their high two bits.
+pub fn dequant_w6_int8(q: &Tensor, scale: &Tensor, group_size: usize) -> Result<Tensor> {
+    let (n, packed_k) = q.dims2()?;
+    if packed_k % 3 != 0 {
+        candle_core::bail!("W6A8 packed width {packed_k} is not divisible by 3")
+    }
+    let k = packed_k * 4 / 3;
+    if group_size == 0 || k % group_size != 0 {
+        candle_core::bail!("W6A8 group size {group_size} does not divide K={k}")
+    }
+    let groups = k / group_size;
+    if scale.elem_count() != n * groups {
+        candle_core::bail!("W6A8 group scale has {} values, expected {}x{}", scale.elem_count(), n, groups)
+    }
+    let bytes = q.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+    let scales = scale.to_device(&Device::Cpu)?.flatten_all()?.to_vec1::<u8>()?;
+    let mut out = Vec::with_capacity(n * k);
+    for r in 0..n {
+        for c in 0..k {
+            let pair = c / 2;
+            let low_byte = bytes[r * packed_k + pair];
+            let low = if c % 2 == 0 { low_byte & 0x0f } else { low_byte >> 4 };
+            let high_byte = bytes[r * packed_k + k / 2 + c / 4];
+            let high = (high_byte >> (2 * (c % 4))) & 0x03;
+            let code = (low | (high << 4)) as i32;
+            let rel = fp8(scales[r * groups + c / group_size]);
+            let value = ((code - 32) as f32 * rel).round_ties_even().clamp(-127.0, 127.0) as i8;
+            out.push(value as u8);
+        }
+    }
+    Tensor::from_vec(out, (n, k), q.device())
+}
+
+/// Dequantize W6A8 to `out`, matching ComfyUI's grouped-int8 conversion and per-channel scale.
+pub fn dequant_w6(q: &Tensor, group_scale: &Tensor, channel_scale: &Tensor, group_size: usize, out: DType) -> Result<Tensor> {
+    dequant_i8(&dequant_w6_int8(q, group_scale, group_size)?, channel_scale, out)
+}
+
 fn fp8(v: u8) -> f32 {
     let e = (v >> 3) & 15;
     let m = v & 7;

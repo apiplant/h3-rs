@@ -57,6 +57,30 @@ __device__ __forceinline__ float fp8e4m3(u8 v) {
     return sgn ? -r : r;
 }
 
+// ComfyUI W6A8 packs six-bit codes into a low-nibble plane followed by a two-bit plane.
+// Decode to grouped int8; the separate per-channel scale is applied by int8_linear.
+extern "C" __global__ void dequant_w6_int8(const u8* q, const u8* srel, u8* out,
+                                           unsigned long long rows, unsigned long long k,
+                                           unsigned long long group_size) {
+    unsigned long long n = rows * k;
+    unsigned long long packed_k = (k * 3) / 4;
+    unsigned long long groups = k / group_size;
+    for (unsigned long long i = blockIdx.x * (unsigned long long)blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)blockDim.x * gridDim.x) {
+        unsigned long long r = i / k, c = i % k;
+        u8 lb = q[r * packed_k + c / 2];
+        int low = (c & 1) ? (lb >> 4) : (lb & 15);
+        u8 hb = q[r * packed_k + k / 2 + c / 4];
+        int high = (hb >> (2 * (c & 3))) & 3;
+        int code = low | (high << 4);
+        float rel = fp8e4m3(srel[r * groups + c / group_size]);
+        int value = __float2int_rn((float)(code - 32) * rel);
+        if (value < -127) value = -127;
+        if (value > 127) value = 127;
+        ((signed char*)out)[i] = (signed char)value;
+    }
+}
+
 __constant__ float E2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
                               -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
 
@@ -587,6 +611,7 @@ fn alloc_out(dev: &candle_core::CudaDevice, dt: DType, n: usize) -> Result<CudaS
         DType::F32 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<f32>(n)? }, dev.clone()),
         DType::F16 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<half::f16>(n)? }, dev.clone()),
         DType::BF16 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<half::bf16>(n)? }, dev.clone()),
+        DType::U8 => CudaStorage::wrap_cuda_slice(unsafe { dev.alloc::<u8>(n)? }, dev.clone()),
         d => candle_core::bail!("alloc_out {d:?}"),
     })
 }
@@ -635,6 +660,51 @@ impl CustomOp2 for DequantI8 {
 /// int8 weight stored as U8 bytes `[N, K]` * f32 scale (`[N, 1]` or scalar) -> `[N, K]` of `out`.
 pub fn dequant_i8(q: &Tensor, scale: &Tensor, out: DType) -> Result<Tensor> {
     q.apply_op2_no_bwd(&scale.to_dtype(DType::F32)?.contiguous()?, &DequantI8 { out })
+}
+
+struct DequantW6Int8 { k: usize, group_size: usize }
+impl CustomOp2 for DequantW6Int8 {
+    fn name(&self) -> &'static str { "dequant_w6_int8" }
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> Result<(CpuStorage, Shape)> {
+        candle_core::bail!("dequant_w6_int8: cuda only")
+    }
+    fn cuda_fwd(&self, q: &CudaStorage, ql: &Layout, s: &CudaStorage, sl: &Layout) -> Result<(CudaStorage, Shape)> {
+        need_contig(ql, "dequant_w6_int8 q")?;
+        need_contig(sl, "dequant_w6_int8 scale")?;
+        let rows = ql.shape().dims()[0];
+        let n = rows * self.k;
+        let groups = self.k / self.group_size;
+        if sl.shape().elem_count() != rows * groups {
+            candle_core::bail!("W6A8 group scale has {} values, expected {}", sl.shape().elem_count(), rows * groups)
+        }
+        let dev = q.device().clone();
+        let func = dev.get_or_load_custom_func("dequant_w6_int8", MODULE, ptx()?)?;
+        let out = alloc_out(&dev, DType::U8, n)?;
+        let (qp, sp, op) = (dev_ptr(q, ql)?, dev_ptr(s, sl)?, out_ptr(&out)?);
+        let (r, k, g) = (rows as u64, self.k as u64, self.group_size as u64);
+        let mut b = func.builder();
+        b.arg(&qp).arg(&sp).arg(&op).arg(&r).arg(&k).arg(&g);
+        unsafe { b.launch(grid_for(n)) }.w()?;
+        Ok((out, Shape::from((rows, self.k))))
+    }
+}
+
+/// Decode W6A8 packed weights to grouped int8. The per-channel scale remains separate.
+pub fn dequant_w6_int8(q: &Tensor, group_scale: &Tensor, group_size: usize) -> Result<Tensor> {
+    let (_rows, packed_k) = q.dims2()?;
+    if packed_k % 3 != 0 || group_size == 0 {
+        candle_core::bail!("invalid W6A8 shape or group size: packed K={packed_k}, group={group_size}")
+    }
+    let k = packed_k * 4 / 3;
+    if k % group_size != 0 {
+        candle_core::bail!("W6A8 group size {group_size} does not divide K={k}")
+    }
+    q.apply_op2_no_bwd(group_scale, &DequantW6Int8 { k, group_size })
+}
+
+/// Dequantize W6A8 to `out`, matching ComfyUI's grouped-int8 conversion and per-channel scale.
+pub fn dequant_w6(q: &Tensor, group_scale: &Tensor, channel_scale: &Tensor, group_size: usize, out: DType) -> Result<Tensor> {
+    dequant_i8(&dequant_w6_int8(q, group_scale, group_size)?, channel_scale, out)
 }
 
 struct DequantNvfp4 {

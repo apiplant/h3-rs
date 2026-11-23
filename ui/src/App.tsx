@@ -61,8 +61,10 @@ interface Saved {
   seconds: number;
   steps: string;
   seed: string;
-  lora: string;
-  loraStrength: number;
+  loras: { name: string; strength: number }[];
+  /** Older saved UI state before LoRA stacks were supported. */
+  lora?: string;
+  loraStrength?: number;
   sampler: "res_multistep" | "euler";
   shiftV: number;
   shiftA: number;
@@ -254,8 +256,7 @@ export function App() {
   const [seconds, setSeconds] = createSignal(saved.seconds ?? 5);
   const [steps, setSteps] = createSignal(saved.steps ?? "");
   const [seed, setSeed] = createSignal(saved.seed ?? "");
-  const [lora, setLora] = createSignal(saved.lora ?? "");
-  const [loraStrength, setLoraStrength] = createSignal(saved.loraStrength ?? 1);
+  const [loras, setLoras] = createSignal(saved.loras ?? (saved.lora ? [{ name: saved.lora, strength: saved.loraStrength ?? 1 }] : []));
   const [sampler, setSampler] = createSignal<Saved["sampler"]>(saved.sampler ?? "res_multistep");
   const [shiftV, setShiftV] = createSignal(saved.shiftV ?? 12);
   const [shiftA, setShiftA] = createSignal(saved.shiftA ?? 3);
@@ -324,7 +325,7 @@ export function App() {
   const refreshInfo = () => fetchInfo().then(setInfo).catch(() => {});
 
   createEffect(
-    () => JSON.stringify({ mode: mode(), prompt: prompt(), aspect: aspect(), mp: mp(), seconds: seconds(), steps: steps(), seed: seed(), lora: lora(), loraStrength: loraStrength(), sampler: sampler(), shiftV: shiftV(), shiftA: shiftA(), crf: crf(), fit: fit(), refSize: refSize(), mute: mute(), custom: custom(), cw: cw(), ch: ch(), upscale: upscale(), factor: factor(), split: split() }),
+    () => JSON.stringify({ mode: mode(), prompt: prompt(), aspect: aspect(), mp: mp(), seconds: seconds(), steps: steps(), seed: seed(), loras: loras(), sampler: sampler(), shiftV: shiftV(), shiftA: shiftA(), crf: crf(), fit: fit(), refSize: refSize(), mute: mute(), custom: custom(), cw: cw(), ch: ch(), upscale: upscale(), factor: factor(), split: split() }),
     (json) => {
       try {
         localStorage.setItem(STORE, json);
@@ -373,6 +374,21 @@ export function App() {
     }, 0);
   }
 
+  function addLora() {
+    const current = loras();
+    const base = current.length ? current : serverLoras();
+    const used = new Set(base.map((l) => l.name.split("/").pop()));
+    const next = info()?.loras.find((name) => !used.has(name.split("/").pop())) ?? info()?.loras[0] ?? "none";
+    setLoras([...base, { name: next, strength: 1 }]);
+  }
+
+  function updateLora(index: number, update: Partial<{ name: string; strength: number }>) {
+    setLoras((current) => current.map((entry, i) => (i === index ? { ...entry, ...update } : entry)));
+  }
+
+  const serverLoras = () => info()?.default_loras ?? (info()?.default_lora ? [{ name: info()!.default_lora!, strength: 1 }] : []);
+  const defaultLoraLabel = () => serverLoras().map((l) => l.name.split("/").pop()).join(" + ") || "None";
+
   async function add(kind: "image" | "video" | "audio", files: File[], put: (p: Picked[]) => void) {
     const ok = files.filter((f) => f.type.startsWith(`${kind}/`) || (kind === "video" && /\.(mp4|mov|webm|mkv)$/i.test(f.name)));
     if (!ok.length) return;
@@ -399,10 +415,7 @@ export function App() {
       req.upscale_split = split();
     }
     if (steps().trim() !== "") req.steps = Math.max(1, Math.floor(Number(steps())));
-    if (lora()) {
-      req.lora = lora();
-      if (lora() !== "none") req.lora_strength = loraStrength();
-    }
+    if (loras().length) req.loras = loras();
     const m = mode();
     if (m !== "refs" && guides().length) {
       req.guides = await Promise.all(guides().map(async (g) => ({ kind: g.kind === "audio" ? ("audio" as const) : ("image" as const), data: await dataUrl(g.p.file), frame: Math.trunc(g.frame) })));
@@ -530,6 +543,18 @@ export function App() {
     return { cls: "bg-ok shadow-[0_0_8px_var(--color-ok)]", label: "Engine ready" };
   };
 
+  const progressLabel = () => {
+    const s = st();
+    if (s?.state === "starting" && s.queued > 1) return `Waiting · ${s.queued - 1} ahead`;
+    if (s?.stage === "downloading") return "Downloading model";
+    if (s?.stage === "upscaling") return "Upscaling latent";
+    return STAGES[stageIndex()]?.label ?? "Starting";
+  };
+  const progressValue = () => {
+    const s = st();
+    return s?.total ? Math.max(0, Math.min(1, s.done / s.total)) : null;
+  };
+
   const modeNeedsMedia = () => (mode() === "refs" && !refImgs().length && !refVids().length && !refAuds().length) || (mode() === "frames" && !first() && !last()) || (mode() === "edit" && (!src() || !maskF()));
 
   return (
@@ -543,7 +568,19 @@ export function App() {
             <span class="rounded bg-ink-800 px-1.5 py-px font-mono text-[10.5px] text-ink-400">v{info()!.version}</span>
           </Show>
         </div>
-        <div class="flex-1" />
+        <div class="flex min-w-0 flex-1 justify-center">
+          <Show when={busy()}>
+            <div class="flex w-full max-w-[360px] items-center gap-2.5" title={`${progressLabel()} · ${elapsed().toFixed(1)} s${rate() > 0 ? ` · ${rate().toFixed(2)} s/step · about ${Math.ceil(eta())} s left` : ""}`}>
+              <span class="hidden w-[132px] flex-none truncate text-xs text-ink-300 sm:block">{progressLabel()}</span>
+              <div class="relative h-1.5 min-w-8 flex-1 overflow-hidden rounded-full bg-ink-800">
+                <Show when={progressValue() !== null} fallback={<div class="absolute inset-y-0 w-2/5 animate-sweep rounded-full bg-[linear-gradient(90deg,transparent,var(--color-accent),transparent)]" />}>
+                  <div class="h-full rounded-full bg-[linear-gradient(90deg,var(--color-accent-strong),var(--color-glow))] transition-[width] duration-300" style={{ width: `${progressValue()! * 100}%` }} />
+                </Show>
+              </div>
+              <span class="hidden w-12 flex-none text-right font-mono text-[11px] text-ink-400 md:block">{sampling() ? `${sampling()!.done}/${sampling()!.total}` : `${elapsed().toFixed(0)}s`}</span>
+            </div>
+          </Show>
+        </div>
         <div class="flex items-center gap-2">
           <span class="inline-flex h-6 items-center gap-1.5 rounded-full border border-ink-700 bg-ink-850 px-2.5 text-xs text-ink-300">
             <span class={`${dot} ${status().cls}`} /> {status().label}
@@ -580,22 +617,26 @@ export function App() {
           </div>
           <div class="flex min-h-0 flex-1 flex-col overflow-y-auto">
             <div class="relative min-h-[200px] flex-1">
-              <div class={editorBack} ref={back} aria-hidden="true">
-                <For each={segments()}>
-                  {(s) => (s.kind ? <span class={s.kind === "Picture" ? tokPic : s.kind === "Video" ? tokVid : tokAud}>{s.t}</span> : s.t)}
-                </For>
-              </div>
+              <Show when={prompt().length <= 500}>
+                <div class={editorBack} ref={back} aria-hidden="true">
+                  <For each={segments()}>
+                    {(s) => (s.kind ? <span class={s.kind === "Picture" ? tokPic : s.kind === "Video" ? tokVid : tokAud}>{s.t}</span> : s.t)}
+                  </For>
+                </div>
+              </Show>
               <textarea
                 ref={ta}
-                class={editorInput}
+                class={`${editorInput} ${prompt().length > 500 ? "!text-ink-100" : ""}`}
                 value={prompt()}
+                wrap="soft"
                 spellcheck={false}
                 onInput={(e) => {
                   touched = true;
                   setPrompt(e.currentTarget.value);
+                  if (back) back.scrollTop = ta.scrollTop;
                 }}
                 onFocus={() => (touched = true)}
-                onScroll={() => (back.scrollTop = ta.scrollTop)}
+                onScroll={() => { if (back) back.scrollTop = ta.scrollTop; }}
                 placeholder="Describe the scene, and the sound that goes with it: footsteps, rain, a voice saying something specific…"
               />
             </div>
@@ -917,46 +958,6 @@ export function App() {
                   </p>
                 </div>
               </Show>
-              <Show when={busy()}>
-                <div class="absolute inset-0 grid place-items-center bg-ink-950/80 p-6 backdrop-blur-sm">
-                  <div class="w-full max-w-md">
-                    <div class="mb-1 flex items-baseline justify-between">
-                      <span class="text-sm font-medium text-ink-100">
-                        {st()?.state === "starting" && (st()?.queued ?? 0) > 1 ? `Waiting for ${st()!.queued - 1} ahead of you…` : (st()?.stage === "downloading" ? "Downloading a model" : st()?.stage === "upscaling" ? "Upscaling the latent" : (STAGES[stageIndex()]?.label ?? "Starting"))}
-                        …
-                      </span>
-                      <span class="font-mono text-xs text-ink-400">{elapsed().toFixed(1)} s</span>
-                    </div>
-                    <div class="relative h-2 overflow-hidden rounded-full bg-ink-800">
-                      <Show
-                        when={sampling()}
-                        fallback={<div class="absolute inset-y-0 w-2/5 animate-sweep rounded-full bg-[linear-gradient(90deg,transparent,var(--color-accent),transparent)]" />}
-                      >
-                        {(s) => (
-                          <div
-                            class="h-full rounded-full bg-[linear-gradient(90deg,var(--color-accent-strong),var(--color-glow))] transition-[width] duration-300"
-                            style={{ width: `${(s().done / Math.max(1, s().total)) * 100}%` }}
-                          />
-                        )}
-                      </Show>
-                    </div>
-                    <div class="mt-1.5 flex justify-between font-mono text-[11px] text-ink-400">
-                      <span>{sampling() ? `step ${sampling()!.done} / ${sampling()!.total}` : st()?.stage === "downloading" && st()!.total ? `${st()!.done} / ${st()!.total} MB` : st()?.stage === "decoding" && st()!.total ? `chunk ${st()!.done} / ${st()!.total}` : " "}</span>
-                      <span>{rate() > 0 ? `${rate().toFixed(2)} s/step${eta() > 0 ? ` · ~${Math.ceil(eta())} s left` : ""}` : " "}</span>
-                    </div>
-                    <ol class="mt-5 grid grid-cols-4 gap-1.5">
-                      <For each={STAGES}>
-                        {(s, i) => (
-                          <li class={`rounded-lg border px-2 py-1.5 text-center text-[11px] ${i() < stageIndex() ? "border-ok/30 text-ok" : i() === stageIndex() ? "border-accent/60 bg-accent/10 text-ink-100" : "border-ink-700 text-ink-500"}`}>
-                            {i() < stageIndex() ? "✓ " : ""}
-                            {s.label.split(" ")[0]}
-                          </li>
-                        )}
-                      </For>
-                    </ol>
-                  </div>
-                </div>
-              </Show>
             </div>
             <Show when={shown()}>
               {(t) => (
@@ -1121,21 +1122,36 @@ export function App() {
             </Show>
 
             <div>
-              <div class={sectionLabel}>LoRA</div>
-              <div class="relative w-full">
-                <select class={select} value={lora()} onChange={(e) => setLora(e.currentTarget.value)}>
-                  <option value="">{info()?.default_lora ? `Server default (${info()!.default_lora!.split("/").pop()})` : "None"}</option>
-                  <Show when={info()?.default_lora}>
-                    <option value="none">None</option>
-                  </Show>
-                  <For each={info()?.loras ?? []}>{(l) => <option value={l}>{info()?.lora_ratings?.[l] ? `[${info()!.lora_ratings![l]}] ` : ""}{l.replace(/\.safetensors$/, "")}</option>}</For>
-                </select>
-                <Icon name="chevron" size={13} class="pointer-events-none absolute top-2.5 right-2.5 text-ink-400" />
+              <div class={sectionLabel}>
+                <span>LoRA stack</span>
+                <button class={`${chipBtn} !h-6 !px-2`} onClick={addLora}><Icon name="plus" size={11} /> Add LoRA</button>
               </div>
-              <Show when={lora() && lora() !== "none"}>
-                <Slider label="Strength" value={loraStrength()} min={0} max={2} step={0.05} digits={2} onChange={setLoraStrength} />
+              <Show when={!loras().length}>
+                <p class="mb-2 rounded-lg border border-ink-700 bg-ink-850 px-2.5 py-2 text-xs text-ink-300">Server default: <span class="text-ink-100">{defaultLoraLabel()}</span></p>
               </Show>
-              <p class="mt-1.5 text-xs leading-snug text-ink-500">Turbo LoRAs need fewer steps: 8 for text and frames, 4 for references. A new LoRA is merged on the first request that uses it. Rated LoRAs are listed first: [A] recommended, [B] works but weaker, [C] not recommended.</p>
+              <For each={loras()}>
+                {(entry, i) => (
+                  <div class="mb-2 rounded-lg border border-ink-700 bg-ink-850 p-2">
+                    <div class="flex items-center gap-1.5">
+                      <div class="relative min-w-0 flex-1">
+                        <select class={select} value={entry.name} onChange={(e) => updateLora(i(), { name: e.currentTarget.value })}>
+                          <option value="none">None</option>
+                          <For each={serverLoras()}>{(l) => <Show when={!(info()?.loras ?? []).includes(l.name)}><option value={l.name}>{l.name.split("/").pop()?.replace(/\.safetensors$/, "")}</option></Show>}</For>
+                          <For each={info()?.loras ?? []}>{(name) => <option value={name}>{info()?.lora_ratings?.[name] ? `[${info()!.lora_ratings![name]}] ` : ""}{name.replace(/\.safetensors$/, "")}</option>}</For>
+                        </select>
+                        <Icon name="chevron" size={13} class="pointer-events-none absolute top-2.5 right-2.5 text-ink-400" />
+                      </div>
+                      <button class={`${btn} ${btnIcon}`} aria-label={`Remove LoRA ${i() + 1}`} title="Remove LoRA" onClick={() => setLoras((current) => current.filter((_, j) => j !== i()))}>
+                        <Icon name="x" size={13} />
+                      </button>
+                    </div>
+                    <Show when={entry.name !== "none"}>
+                      <Slider label="Strength" value={entry.strength} min={0} max={2} step={0.05} digits={2} onChange={(strength) => updateLora(i(), { strength })} />
+                    </Show>
+                  </div>
+                )}
+              </For>
+              <p class="mt-1.5 text-xs leading-snug text-ink-500">Stack style LoRAs with Turbo LoRAs and set each strength. Turbo LoRAs need fewer steps: 8 for text and frames, 4 for references. Rated LoRAs are listed first: [A] recommended, [B] works but weaker, [C] not recommended.</p>
               <div class="mt-2 flex gap-1.5">
                 <button class={`${chipBtn} !px-2`} onClick={() => setSteps("8")}>8 steps</button>
                 <button class={`${chipBtn} !px-2`} onClick={() => setSteps("4")}>4 steps</button>

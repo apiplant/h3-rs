@@ -25,8 +25,8 @@ struct Models {
     /// ComfyUI `models` directory (model names below resolve against its subfolders).
     #[arg(long, default_value_os_t = default_models_dir(), env = "H3_MODELS_DIR")]
     models_dir: PathBuf,
-    /// Model to run: h3, fasth3 or singularity (each lives in `diffusion_models/<name>/`, downloaded when missing;
-    /// see `h3 models`). `serve` asks when this is left out on a terminal.
+    /// Model to run: h3, fasth3, singularity, or 10eros-learned; downloaded when missing;
+    /// see `h3 models`. `serve` asks when this is left out on a terminal.
     #[arg(long, env = "H3_MODEL")]
     model: Option<String>,
     /// DiT checkpoint file or path; overrides --model (default: fl2va, or ref2va when references are given).
@@ -197,9 +197,9 @@ enum Cmd {
         /// Share of the sampling at which the ControlNet stops (1 = last step).
         #[arg(long, default_value_t = 1.0, requires = "controlnet")]
         control_end: f64,
-        /// LoRA file (path, or name in models/loras).
+        /// LoRA file (path, or name in models/loras); repeat to stack LoRAs.
         #[arg(long)]
-        lora: Option<String>,
+        lora: Vec<String>,
         #[arg(long, default_value_t = 1.0)]
         lora_strength: f64,
         /// Sample at the canvas size, upscale the latent SCALE times, and refine the rest of the steps at that
@@ -282,9 +282,9 @@ enum Cmd {
         /// Default sampling steps for requests that leave it out (default: the model's own)
         #[arg(long)]
         steps: Option<usize>,
-        /// Default LoRA for requests that leave `lora` out (name in models/loras or a path)
+        /// Default LoRA for requests that leave `loras` out (repeat to stack; name in models/loras or a path)
         #[arg(long)]
-        lora: Option<String>,
+        lora: Vec<String>,
         #[arg(long, default_value_t = 1.0)]
         lora_strength: f64,
         #[command(flatten)]
@@ -297,9 +297,9 @@ enum Cmd {
         #[arg(long, default_value_os_t = default_models_dir(), env = "H3_MODELS_DIR")]
         models_dir: PathBuf,
     },
-    /// Download models (h3, fasth3, singularity) into `diffusion_models/<name>/` without running anything.
+    /// Download a model into `diffusion_models/<name>/` without running anything.
     Download {
-        /// One or more of: h3, fasth3, singularity
+        /// One or more names from `h3 models`.
         #[arg(required = true)]
         names: Vec<String>,
         #[arg(long, default_value_os_t = default_models_dir(), env = "H3_MODELS_DIR")]
@@ -317,7 +317,8 @@ fn main() -> Result<()> {
             for l in h3_rs::variants::listing(&models_dir) {
                 println!("  {l}");
             }
-            println!("\nrun one with `h3 serve --model <name>`; it is downloaded on first use (or `h3 download <name>`)");
+            println!("\nrun one with `h3 serve --model <name>`; models download on first use (or `h3 download <name>`), existing files in `diffusion_models/` are used as-is");
+            println!("hidden 10Eros checkpoints remain selectable with `h3 serve --model 10eros-learned`, `--model 10eros`, or `--model 10eros-hybrid`");
         }
         Cmd::Download { names, models_dir } => {
             for n in names {
@@ -397,7 +398,7 @@ fn main() -> Result<()> {
                 })
                 .transpose()?
                 .map(|p| p.display().to_string());
-            let steps = steps.or(lora.as_deref().and_then(h3_rs::lora::preset_steps)).or(variant.map(|v| v.steps)).unwrap_or(20);
+            let steps = steps.or_else(|| lora.iter().find_map(|l| h3_rs::lora::preset_steps(l))).or(variant.map(|v| v.steps)).unwrap_or(20);
             let paths = ModelPaths::resolve(&models.models_dir, variant_dit.as_deref().or(models.dit.as_deref()).unwrap_or(default_dit), &models.text_encoder, &models.video_vae, &models.audio_vae)?
                 .with_upscaler(&models.models_dir, &models.upscaler, upscale.is_some())?;
             let aspect = match aspect {
@@ -407,13 +408,13 @@ fn main() -> Result<()> {
                 }
                 None => None,
             };
-            let lora = match lora {
-                Some(l) => {
+            let loras = lora
+                .into_iter()
+                .map(|l| -> anyhow::Result<_> {
                     let p = if std::path::Path::new(&l).is_file() { l } else { h3_rs::download::ensure(&models.models_dir.join("loras"), &l)?.display().to_string() };
-                    Some((p, lora_strength))
-                }
-                None => None,
-            };
+                    Ok((p, lora_strength))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let guides: Vec<pipeline::Guide> = guide
                 .iter()
                 .map(|g| pipeline::Guide::parse(g, pipeline::GuideKind::Visual))
@@ -448,7 +449,7 @@ fn main() -> Result<()> {
                 shift_audio,
                 first_frame: image,
                 last_frame: last_image,
-                lora,
+                loras,
                 guides,
                 source,
                 source_mute,
@@ -489,28 +490,30 @@ fn main() -> Result<()> {
             };
             let ref_dit = Some(ref_dit); // fetched on the first request with references
             let loras_dir = models.models_dir.join("loras");
-            let lora = lora
+            let loras = lora
+                .into_iter()
                 .map(|l| -> anyhow::Result<_> {
                     let p = if std::path::Path::new(&l).is_file() { l } else { h3_rs::download::ensure(&loras_dir, &l)?.display().to_string() };
                     Ok((p, lora_strength))
                 })
-                .transpose()?;
+                .collect::<anyhow::Result<Vec<_>>>()?;
             let info = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "model": variant.map(|v| v.id),
                 "dit": paths.dit, "ref_dit": ref_dit, "text_encoder": paths.text_encoder,
                 "video_vae": paths.video_vae, "audio_vae": paths.audio_vae, "upscaler": paths.upscaler,
-                "default_steps": steps, "default_lora": lora.as_ref().map(|l| l.0.clone()),
+                "default_steps": steps, "default_lora": loras.first().map(|l| l.0.clone()),
+                "default_loras": loras.iter().map(|(name, strength)| serde_json::json!({"name": name, "strength": strength})).collect::<Vec<_>>(),
                 "memory": memc,
             });
-            let defaults = h3_rs::serve::Defaults { steps, lora: lora.clone(), loras_dir, patches_dir: models.models_dir.join("model_patches") };
+            let defaults = h3_rs::serve::Defaults { steps, loras: loras.clone(), loras_dir, patches_dir: models.models_dir.join("model_patches") };
             let device = mem.device;
             h3_rs::serve::run(
                 move || {
                     let dev = h3_rs::backend::new_device(device)?;
                     h3_rs::kernels::keep_pool_memory(&dev);
                     let mut eng = h3_rs::pipeline::Engine::new(paths, ref_dit, memc, dev, true);
-                    eng.preload_with(lora.as_ref())?;
+                    eng.preload_with(&loras)?;
                     Ok(eng)
                 },
                 defaults,

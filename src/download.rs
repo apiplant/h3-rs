@@ -68,6 +68,15 @@ const KNOWN: &[Known] = &[
     lora("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_4step_fl2va.safetensors", concat!("https://huggingface.co/akhaliq/Pika-H3-Flex-Turbo-LoRA/resolve/main/", "pika_h3_flex_turbo_4step_fl2va.safetensors"), 3_912),
     lora("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_4step_fl2va_lite_r32.safetensors", concat!("https://huggingface.co/akhaliq/Pika-H3-Flex-Turbo-LoRA/resolve/main/", "pika_h3_flex_turbo_4step_fl2va_lite_r32.safetensors"), 310),
     lora("Pika-H3-Flex-Turbo/pika_h3_flex_turbo_8step_hd_fl2va.safetensors", concat!("https://huggingface.co/akhaliq/Pika-H3-Flex-Turbo-LoRA/resolve/main/", "pika_h3_flex_turbo_8step_hd_fl2va.safetensors"), 3_912),
+    // TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches (Eros MLP-only adapters)
+    lora("animeNSFW_e995_r8.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/animeNSFW_e995_r8.safetensors", 33),
+    lora("ass_jiggle_e995_r13.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/ass_jiggle_e995_r13.safetensors", 52),
+    lora("cum_merge_e995_r8.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/cum_merge_e995_r8.safetensors", 43),
+    lora("final_cut_e995_r6.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/final_cut_e995_r6.safetensors", 32),
+    lora("motion_booster_v2_mlp_e995_r8.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/motion_booster_v2_mlp_e995_r8.safetensors", 39),
+    lora("plora_mlp_e995_r4.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/plora_mlp_e995_r4.safetensors", 18),
+    lora("silver_anel_warmup_mlp_e995_r8.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/silver_anel_warmup_mlp_e995_r8.safetensors", 41),
+    lora("slop_bounce_e995_r8.safetensors", "https://huggingface.co/TenStrip/MMH3_Sulphur3Eros_Loras-MLP-energy-patches/resolve/main/slop_bounce_e995_r8.safetensors", 36),
 ];
 
 /// Files this library knows how to download into `<models_dir>/<sub>/`.

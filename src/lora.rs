@@ -1,4 +1,4 @@
-//! ComfyUI-style LoRA files for the H3 DiT (`diffusion_model.<module>.lora_A/B` or
+//! ComfyUI/Kohya LoRA files for the H3 DiT (`diffusion_model.<module>.lora_A/B` or
 //! `lora_down/up`, optional `.alpha`, optional `.reshape_weight` pad-and-add head banks).
 
 use std::sync::Arc;
@@ -41,11 +41,13 @@ impl Lora {
     /// The low-rank pair for `<module>` (module name without `.weight`).
     pub fn delta(&self, module: &str, dev: &Device) -> Result<Option<Delta>> {
         let p = format!("{}{module}", self.prefix);
-        let (up, down) = if self.file.has(&format!("{p}.lora_B.weight")) {
-            (format!("{p}.lora_B.weight"), format!("{p}.lora_A.weight"))
-        } else if self.file.has(&format!("{p}.lora_up.weight")) {
-            (format!("{p}.lora_up.weight"), format!("{p}.lora_down.weight"))
-        } else {
+        let kohya = format!("lora_unet_{}", module.replace('.', "_"));
+        let pairs = [
+            (format!("{p}.lora_B.weight"), format!("{p}.lora_A.weight"), format!("{p}.alpha")),
+            (format!("{p}.lora_up.weight"), format!("{p}.lora_down.weight"), format!("{p}.alpha")),
+            (format!("{kohya}.lora_up.weight"), format!("{kohya}.lora_down.weight"), format!("{kohya}.alpha")),
+        ];
+        let Some((up, down, alpha_key)) = pairs.into_iter().find(|(_, down, _)| self.file.has(down)) else {
             return Ok(None);
         };
         // low-rank factors stay in bf16 (they run in the compute dtype anyway)
@@ -54,7 +56,6 @@ impl Lora {
         let a = a.flatten_from(1)?;
         let b = b.flatten_from(1)?;
         let rank = a.dim(0)? as f64;
-        let alpha_key = format!("{p}.alpha");
         let scale = if self.file.has(&alpha_key) {
             self.file.load_as(&alpha_key, &Device::Cpu, DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0] as f64 / rank
         } else {

@@ -499,7 +499,7 @@ fn dense_f32(f: &Arc<SafeFile>, prefix: &str, dev: &Device) -> Result<QLinear> {
 }
 
 impl Dit {
-    pub fn load(path: &str, dev: &Device, mem: &MemoryConfig, lora: Option<(&Lora, f64)>) -> Result<Self> {
+    pub fn load(path: &str, dev: &Device, mem: &MemoryConfig, loras: &[(Lora, f64)]) -> Result<Self> {
         let f = SafeFile::open(path)?;
         let cfg = DitConfig::detect(&f)?;
         let dtype = DType::BF16;
@@ -515,7 +515,7 @@ impl Dit {
             .iter()
             .map(|p| f.bytes(&format!("blocks.0.{p}.weight")).map(|b| b.len()).unwrap_or(0))
             .sum();
-        let lora_bytes = lora.map(|(l, _)| l.device_bytes()).unwrap_or(0);
+        let lora_bytes: usize = loras.iter().map(|(l, _)| l.device_bytes()).sum();
         let resident = resolve_resident(mem.dit_gpu_blocks, cfg.layers, block_bytes, (mem.reserve_gb * 1e9) as usize + lora_bytes + 2_000_000_000);
         log::info(&format!(
             "DiT: {resident}/{} blocks resident on GPU ({:.1} GB), rest streamed from {}",
@@ -592,10 +592,10 @@ impl Dit {
             captured: Default::default(),
             cfg,
         };
-        if let Some((l, strength)) = lora {
-            dit.apply_lora(l, strength)?;
+        for (l, strength) in loras {
+            dit.apply_lora(l, *strength)?;
         }
-        if lora.is_some() && std::env::var("H3_LORA_RUNTIME").is_err() {
+        if !loras.is_empty() && std::env::var("H3_LORA_RUNTIME").is_err() {
             let t = std::time::Instant::now();
             for b in &mut dit.blocks {
                 for l in [&mut b.qkv, &mut b.out, &mut b.fc1, &mut b.fc2, &mut b.adaln] {

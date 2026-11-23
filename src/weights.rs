@@ -1,5 +1,5 @@
 //! ComfyUI checkpoint access: mmapped safetensors, per-tensor placement (GPU / RAM / disk) and the
-//! quantized linear layer used by every model (dense, `int8_tensorwise` + ConvRot, `nvfp4` + AWQ).
+//! quantized linear layer used by every model (dense, `int8_tensorwise` + ConvRot, `w6a8_int8`, `nvfp4` + AWQ).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -394,6 +394,17 @@ pub enum QFormat {
     Int8 { convrot: Option<usize> },
     /// NVFP4 (e2m1 + fp8 e4m3 block-16 scales + f32 global), optional AWQ input smoothing.
     Nvfp4,
+    /// ComfyUI W6A8: packed uniform int6 codes, FP8 group scales, per-row scale, and ConvRot.
+    W6A8 { group_size: usize, convrot: Option<usize> },
+}
+
+impl QFormat {
+    fn convrot(&self) -> Option<usize> {
+        match self {
+            Self::Int8 { convrot } | Self::W6A8 { convrot, .. } => *convrot,
+            _ => None,
+        }
+    }
 }
 
 /// A low-rank delta `scale * B @ A` added to a linear layer's output.
@@ -509,6 +520,21 @@ impl QLinear {
                 let s = Held::small(file, &format!("{prefix}.weight_scale"), dev)?;
                 (QFormat::Int8 { convrot }, Some(s), None, None, wshape[1])
             }
+            Some("w6a8_int8") => {
+                if wshape[1] % 3 != 0 {
+                    bail!("{prefix}: W6A8 packed width {} is not divisible by 3", wshape[1]);
+                }
+                let c = conf.as_ref().unwrap();
+                let group_size = c["group_size"].as_u64().unwrap_or(16) as usize;
+                let convrot = if c["convrot"].as_bool().unwrap_or(false) {
+                    Some(c["convrot_groupsize"].as_u64().unwrap_or(256) as usize)
+                } else {
+                    None
+                };
+                let s = Held::small(file, &format!("{prefix}.weight_s_channel"), dev)?;
+                let gs = Held::small(file, &format!("{prefix}.weight_s_rel"), dev)?;
+                (QFormat::W6A8 { group_size, convrot }, Some(s), Some(gs), None, wshape[1] * 4 / 3)
+            }
             Some("nvfp4") => {
                 let g = Held::small(file, &format!("{prefix}.weight_scale_2"), dev)?;
                 let bs = Held::new(file, &format!("{prefix}.weight_scale"), place, dev)?;
@@ -580,6 +606,13 @@ impl QLinear {
         Ok(match &self.fmt {
             QFormat::Dense => w.to_dtype(dtype)?,
             QFormat::Int8 { .. } => kernels::dequant_i8(w, &self.scale.as_ref().unwrap().get(dev)?, dtype)?,
+            QFormat::W6A8 { group_size, .. } => kernels::dequant_w6(
+                w,
+                raw.bs.as_ref().context("W6A8 group scales missing")?,
+                &self.scale.as_ref().unwrap().get(dev)?,
+                *group_size,
+                dtype,
+            )?,
             QFormat::Nvfp4 => kernels::dequant_nvfp4(w, raw.bs.as_ref().unwrap(), &self.scale.as_ref().unwrap().get(dev)?, dtype)?,
         })
     }
@@ -587,17 +620,18 @@ impl QLinear {
     /// Dequantized weight in the plain (unrotated) basis.
     pub fn dequant_plain(&self, dev: &Device, dtype: DType) -> Result<Tensor> {
         let w = self.dequant(dev, DType::F32)?;
-        let w = match self.fmt {
-            QFormat::Int8 { convrot: Some(g) } => rotate_activation(&w, g)?,
-            _ => w,
-        };
+        let w = match self.fmt.convrot() { Some(g) => rotate_activation(&w, g)?, None => w };
         Ok(w.to_dtype(dtype)?)
     }
 
     /// `y = x @ W^T + b` (+ LoRA), processing at most `chunk` rows of `x` per GEMM.
     pub fn forward_chunked(&self, x: &Tensor, chunk: usize) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() && matches!(self.fmt, QFormat::W6A8 { .. }) && int8_enabled() {
+            return self.forward_raw(x, &self.fetch(x.device())?, chunk);
+        }
         #[cfg(feature = "mlx")]
-        if x.device().is_metal() && matches!(self.fmt, QFormat::Int8 { .. }) && self.in_features % 64 == 0 {
+        if x.device().is_metal() && matches!(self.fmt, QFormat::Int8 { .. } | QFormat::W6A8 { .. }) && self.in_features % 64 == 0 {
             return self.forward_raw(x, &self.fetch(x.device())?, chunk);
         }
         let w = self.dequant(x.device(), x.dtype())?;
@@ -625,10 +659,7 @@ impl QLinear {
         while start < rows {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
-            let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } => rotate_activation(&xc, g)?,
-                _ => xc.clone(),
-            };
+            let xr = match self.fmt.convrot() { Some(g) => rotate_activation(&xc, g)?, None => xc.clone() };
             let mut y = xr.matmul(&wt)?;
             if let Some(b) = &self.bias {
                 y = y.broadcast_add(&b.to_dtype(y.dtype())?)?;
@@ -707,6 +738,7 @@ impl QLinear {
         };
         match self.fmt {
             QFormat::Nvfp4 => return Ok(()), // keep the runtime path for nvfp4
+            QFormat::W6A8 { .. } => return Ok(()), // preserve the packed format; apply attached LoRAs at runtime
             QFormat::Dense => {
                 let w = self.weight.get(dev)?;
                 let dt = w.dtype();
@@ -835,6 +867,12 @@ impl QLinear {
         if matches!(self.fmt, QFormat::Int8 { .. }) && dev.is_metal() && self.in_features % 64 == 0 {
             return Ok(Prepared::Mlx(crate::apple::Int8Weight::new(&raw.w, &self.scale.as_ref().unwrap().get(dev)?)?));
         }
+        if let QFormat::W6A8 { group_size, .. } = self.fmt {
+            if int8_enabled() && dev.is_cuda() {
+                let w = kernels::dequant_w6_int8(&raw.w, raw.bs.as_ref().context("W6A8 group scales missing")?, group_size)?;
+                return Ok(Prepared::Int8(Raw { w, bs: None }));
+            }
+        }
         Ok(match self.fmt {
             QFormat::Int8 { .. } if int8_enabled() && dev.is_cuda() => Prepared::Int8(raw),
             _ => Prepared::Deq(self.dequant_raw(&raw, dev, dtype)?),
@@ -872,9 +910,9 @@ impl QLinear {
                 let rows = x.elem_count() / k;
                 let x2 = x.reshape((rows, k))?;
                 let dev = x.device();
-                let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } if kernels::can_fuse_rotation(k, g));
-                let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
-                    QFormat::Int8 { convrot: Some(g) } if !fuse => rotate_activation(&x2, g),
+                let fuse = self.fmt.convrot().is_some_and(|g| kernels::can_fuse_rotation(k, g));
+                let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt.convrot() {
+                    Some(g) if !fuse => rotate_activation(&x2, g),
                     _ => Ok(x2),
                 })?;
                 let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -896,9 +934,9 @@ impl QLinear {
         let rows = x.elem_count() / k;
         let x2 = x.reshape((rows, k))?;
         // the warp-level rotation is fused into the quantizer (group 256, K <= 56 groups)
-        let fused_rot = matches!(self.fmt, QFormat::Int8 { convrot: Some(256) }) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
-        let xr = match self.fmt {
-            QFormat::Int8 { convrot: Some(g) } if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
+        let fused_rot = self.fmt.convrot() == Some(256) && k / 256 <= 56 && std::env::var("H3_ROT").map(|v| v != "gemm").unwrap_or(true);
+        let xr = match self.fmt.convrot() {
+            Some(g) if !fused_rot => crate::dit::prof::time("  rotate", x.device(), || rotate_activation(&x2, g))?,
             _ => x2,
         };
         let scale = self.scale.as_ref().unwrap().get(x.device())?;
@@ -927,9 +965,9 @@ impl QLinear {
             let n = chunk.min(rows - start);
             let xc = x2.narrow(0, start, n)?;
             let dev = x.device();
-            let fuse = matches!(self.fmt, QFormat::Int8 { convrot: Some(g) } if kernels::can_fuse_rotation(k, g));
-            let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } if !fuse => rotate_activation(&xc, g),
+            let fuse = self.fmt.convrot().is_some_and(|g| kernels::can_fuse_rotation(k, g));
+            let xr = crate::dit::prof::time("  rotate", dev, || match self.fmt.convrot() {
+                Some(g) if !fuse => rotate_activation(&xc, g),
                 _ => Ok(xc.clone()),
             })?;
             let mut y = crate::dit::prof::time("  int8 gemm", dev, || kernels::int8_linear_ex(&xr, &raw.w, &scale, self.bias.as_ref(), x.dtype(), false, fuse))?;
@@ -967,10 +1005,7 @@ impl QLinear {
         let mut outs = Vec::new();
         for start in (0..rows).step_by(chunk.max(1)) {
             let xc = x2.narrow(0, start, chunk.max(1).min(rows-start))?;
-            let xr = match self.fmt {
-                QFormat::Int8 { convrot: Some(g) } => rotate_activation(&xc, g)?,
-                _ => xc.clone(),
-            };
+            let xr = match self.fmt.convrot() { Some(g) => rotate_activation(&xc, g)?, None => xc.clone() };
             let mut y = w.forward(&xr)?;
             if let Some(b) = &self.bias { y = y.broadcast_add(&b.to_dtype(y.dtype())?)?; }
             for l in &self.loras {

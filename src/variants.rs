@@ -46,6 +46,39 @@ pub const VARIANTS: &[Variant] = &[
         main: File { name: "Minimax-h3_Singularity_ref2va_v2_pruned_int8_convrot.safetensors", url: "https://huggingface.co/WAS/Minimax-h3_Singularity_v2_pruned/resolve/main/Minimax-h3_Singularity_ref2va_v2_pruned_int8_convrot.safetensors", mb: 20_968 },
         reference: None,
     },
+    Variant {
+        id: "10eros",
+        title: "10Eros Max HQ (8-step Turbo, hybrid int8)",
+        steps: 8,
+        main: File {
+            name: "10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors",
+            url: "https://huggingface.co/TenStrip/10Eros-Max/resolve/main/10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors",
+            mb: 21_833,
+        },
+        reference: None,
+    },
+    Variant {
+        id: "10eros-hybrid",
+        title: "10Eros Max (8-step Turbo, hybrid)",
+        steps: 8,
+        main: File {
+            name: "10Eros_Max_8stepTurbo_v1.0_hybrid.safetensors",
+            url: "https://huggingface.co/TenStrip/10Eros-Max/resolve/main/10Eros_Max_8stepTurbo_v1.0_hybrid.safetensors",
+            mb: 38_360,
+        },
+        reference: None,
+    },
+    Variant {
+        id: "10eros-learned",
+        title: "10Eros Max learned HQ (8-step, two-pass workflow)",
+        steps: 8,
+        main: File {
+            name: "10Eros_Max_8stepTurbo_v1.0_hybrid_activation_learned_HQ.safetensors",
+            url: "https://huggingface.co/LokkenJP/TenEros_Max_optimized_learned/resolve/main/10Eros_Max_8stepTurbo_v1.0_hybrid_activation_learned_HQ.safetensors",
+            mb: 17_092,
+        },
+        reference: None,
+    },
 ];
 
 pub fn find(id: &str) -> Result<&'static Variant> {
@@ -122,10 +155,16 @@ pub fn ensure_path(path: &Path) -> Result<()> {
 
 /// One line per variant: `h3  MiniMax H3 …  42.0 GB  downloaded`.
 pub fn listing(models_dir: &Path) -> Vec<String> {
-    VARIANTS
-        .iter()
-        .map(|v| format!("{:<12} {:<52} {:>5.1} GB  {}", v.id, v.title, v.size_gb(), if v.downloaded(models_dir) { "downloaded" } else { "not downloaded" }))
+    startup_choices()
+        .map(|v| {
+            format!("{:<12} {:<52} {:>5.1} GB  {}", v.id, v.title, v.size_gb(), if v.downloaded(models_dir) { "downloaded" } else { "not downloaded" })
+        })
         .collect()
+}
+
+/// Models shown in the startup chooser and `h3 models`. Eros checkpoints remain addressable by ID.
+fn startup_choices() -> impl Iterator<Item = &'static Variant> {
+    VARIANTS.iter().filter(|v| !matches!(v.id, "10eros" | "10eros-hybrid" | "10eros-learned"))
 }
 
 /// Ask on the terminal which variant to serve. `None` when there's no terminal to ask on.
@@ -134,6 +173,7 @@ pub fn choose(models_dir: &Path) -> Result<Option<&'static Variant>> {
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
+    let choices: Vec<_> = startup_choices().collect();
     eprintln!("\nWhich model?\n");
     for (i, l) in listing(models_dir).iter().enumerate() {
         eprintln!("  {}) {l}", i + 1);
@@ -149,7 +189,7 @@ pub fn choose(models_dir: &Path) -> Result<Option<&'static Variant>> {
         if s.is_empty() {
             return Ok(Some(&VARIANTS[0]));
         }
-        if let Some(v) = s.parse::<usize>().ok().and_then(|n| VARIANTS.get(n.wrapping_sub(1))).or_else(|| find(s).ok()) {
+        if let Some(v) = s.parse::<usize>().ok().and_then(|n| choices.get(n.wrapping_sub(1)).copied()).or_else(|| choices.iter().find(|v| v.id.eq_ignore_ascii_case(s)).copied()) {
             return Ok(Some(v));
         }
         eprintln!("no such model: {s}");

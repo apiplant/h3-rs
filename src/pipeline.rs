@@ -150,7 +150,7 @@ pub struct Request {
     pub shift_audio: f64,
     pub first_frame: Option<String>,
     pub last_frame: Option<String>,
-    pub lora: Option<(String, f64)>,
+    pub loras: Vec<(String, f64)>,
     /// Images, clips and audio anchored at arbitrary frames (ComfyUI `MiniMaxH3AddGuide`), in order.
     pub guides: Vec<Guide>,
     /// Video (or image) to edit: with `mask`, the regions the mask keeps are taken from it, and its soundtrack is
@@ -278,7 +278,7 @@ impl Default for Request {
             shift_audio: 3.0,
             first_frame: None,
             last_frame: None,
-            lora: None,
+            loras: vec![],
             guides: vec![],
             source: None,
             source_mute: false,
@@ -368,7 +368,7 @@ pub struct Engine {
     pub keep: bool,
     tok: Option<Tokenizer>,
     te: Option<TextEncoder>,
-    dit: Option<((PathBuf, Option<(String, u64)>), Dit)>,
+    dit: Option<((PathBuf, Vec<(String, u64)>), Dit)>,
     vvae: Option<VideoVae>,
     avae: Option<AudioVae>,
     aenc: Option<AudioEncoder>,
@@ -381,14 +381,14 @@ impl Engine {
 
     /// Load everything a plain t2va/fl2va request needs (server warm-up). The DiT loads last so its
     /// automatic GPU residency sees what the other models left free.
-    pub fn preload_with(&mut self, lora: Option<&(String, f64)>) -> Result<()> {
+    pub fn preload_with(&mut self, loras: &[(String, f64)]) -> Result<()> {
         self.tokenizer()?;
         self.text_encoder()?;
         self.video_vae()?;
         self.audio_vae()?;
         self.audio_encoder()?;
         let p = self.paths.dit.clone();
-        self.dit(&p, lora)?;
+        self.dit(&p, loras)?;
         Ok(())
     }
 
@@ -428,13 +428,13 @@ impl Engine {
         Ok(self.aenc.as_ref().unwrap())
     }
 
-    fn dit(&mut self, path: &Path, lora: Option<&(String, f64)>) -> Result<&mut Dit> {
-        let key = (path.to_path_buf(), lora.map(|(p, s)| (p.clone(), s.to_bits())));
+    fn dit(&mut self, path: &Path, loras: &[(String, f64)]) -> Result<&mut Dit> {
+        let key = (path.to_path_buf(), loras.iter().map(|(p, s)| (p.clone(), s.to_bits())).collect());
         if self.dit.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
             self.dit = None; // free the old one first
             let t = Instant::now();
-            let l = lora.map(|(p, s)| Lora::open(p).map(|l| (l, *s))).transpose()?;
-            let d = Dit::load(&path.display().to_string(), &self.dev, &self.mem, l.as_ref().map(|(l, s)| (l, *s)))?;
+            let loaded = loras.iter().map(|(p, s)| Ok((Lora::open(p)?, *s))).collect::<Result<Vec<_>>>()?;
+            let d = Dit::load(&path.display().to_string(), &self.dev, &self.mem, &loaded)?;
             log::info(&format!("DiT loaded in {:.1}s ({})", t.elapsed().as_secs_f64(), vram()));
             self.dit = Some((key, d));
         }
@@ -858,7 +858,7 @@ pub fn generate(&mut self, req: &Request) -> Result<()> {
     let dev_for_upscaler = self.dev.clone();
     let keep_models = self.keep;
     let offload = self.mem.offload;
-    let dit = self.dit(&dit_path, req.lora.as_ref())?;
+    let dit = self.dit(&dit_path, &req.loras)?;
     if dit.resident_blocks() != dit.base_resident_blocks() {
         dit.set_resident(dit.base_resident_blocks())?;
     }
@@ -1119,8 +1119,8 @@ pub fn refine(&mut self, req: &Refine, zv: &Tensor, za: Option<&Tensor>) -> Resu
     };
 
     let dit_path = self.paths.dit.clone();
-    let lora = Some((req.lora.0.clone(), req.lora.1));
-    let dit = self.dit(&dit_path, lora.as_ref())?;
+    let loras = vec![(req.lora.0.clone(), req.lora.1)];
+    let dit = self.dit(&dit_path, &loras)?;
     dit.cfg.shift_video = req.shift_video;
     dit.cfg.shift_audio = req.shift_audio;
     let audio_scale = dit.audio_scale();
